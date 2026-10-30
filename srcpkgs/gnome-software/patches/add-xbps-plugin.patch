@@ -1,0 +1,1595 @@
+diff --git a/meson_options.txt b/meson_options.txt
+index cd49cf5..0c87aaf 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -27,3 +27,4 @@ option('dkms', type : 'boolean', value : false, description : 'enable DKMS plugi
+ # FIXME Switch the systemd-sysupdate option to true by default once
+ # systemd-sysupdate and Software's matching plugin are deemed mature enough.
+ option('systemd-sysupdate', type : 'boolean', value : false, description : 'enable systemd-sysupdate support')
++option('xbps', type : 'boolean', value : false, description : 'enable Void Linux xbps support')
+diff --git a/plugins/meson.build b/plugins/meson.build
+index a108e47..c1f33f9 100644
+--- a/plugins/meson.build
++++ b/plugins/meson.build
+@@ -50,3 +50,6 @@ endif
+ if get_option('systemd-sysupdate')
+   subdir('systemd-sysupdate')
+ endif
++if get_option('xbps')
++  subdir('xbps')
++endif
+diff --git a/plugins/xbps/gs-plugin-xbps.c b/plugins/xbps/gs-plugin-xbps.c
+new file mode 100644
+index 0000000..b57ef13
+--- /dev/null
++++ b/plugins/xbps/gs-plugin-xbps.c
+@@ -0,0 +1,1023 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
++ * vi:set noexpandtab tabstop=8 shiftwidth=8:
++ *
++ * Copyright (C) 2026 Void Linux Stores
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++/*
++ * SECTION:
++ * Native xbps support for gnome-software.
++ *
++ * This plugin deliberately shells out to the xbps command line tools instead
++ * of linking libxbps (unstable ABI) or adding a privileged D-Bus daemon.
++ * Privileged operations go through pkexec with an explicit argv array; no
++ * user-visible string ever reaches a shell.
++ *
++ * The plugin is deliberately AppStream-independent, in the same spirit as
++ * KDE Discover's xbps backend: every package is exposed as a GsApp built
++ * directly from xbps query output, with a synthetic reverse-DNS id so it can
++ * be addressed by the shell, the CLI and the details page even when no
++ * AppStream catalogue exists. If a catalogue is present, appstream sets its
++ * own (better) id and metadata first and this plugin simply adopts the result.
++ *
++ * Supported query surfaces: search ("keywords"), the installed list
++ * ("is-installed") and the updates list ("is-for-update"). Browse/category
++ * queries need AppStream catalogues, which Void does not ship, so they are
++ * reported as unsupported and flatpak/appstream keep handling them.
++ */
++
++#include <config.h>
++
++#include <gio/gio.h>
++#include <glib.h>
++
++#include <gnome-software.h>
++
++#include "gs-plugin-xbps.h"
++#include "gs-xbps-utils.h"
++
++#define XBPS_QUERY	"/usr/bin/xbps-query"
++#define XBPS_INSTALL	"/usr/bin/xbps-install"
++#define XBPS_REMOVE	"/usr/bin/xbps-remove"
++#define PKEXEC		"/usr/bin/pkexec"
++
++/* "void" is the stable data-id origin; the UI label stays human-readable. */
++#define XBPS_ORIGIN	"void"
++#define XBPS_ORIGIN_UI	"Void Linux"
++#define XBPS_APP_ID_PREFIX "org.voidlinux.xbps."
++#define XBPS_ICON_NAME	"application-x-executable"
++
++struct _GsPluginXbps {
++	GsPlugin	 parent;
++
++	/* pkgname → 1; packages xbps is known to own (adopt_app) */
++	GHashTable	*owned;
++	/* pkgname → GHashTable of `xbps-query -R` properties */
++	GHashTable	*info_cache;
++};
++
++G_DEFINE_TYPE (GsPluginXbps, gs_plugin_xbps, GS_TYPE_PLUGIN)
++
++static void
++gs_plugin_xbps_finalize (GObject *object)
++{
++	GsPluginXbps *self = GS_PLUGIN_XBPS (object);
++
++	g_clear_pointer (&self->owned, g_hash_table_unref);
++	g_clear_pointer (&self->info_cache, g_hash_table_unref);
++
++	G_OBJECT_CLASS (gs_plugin_xbps_parent_class)->finalize (object);
++}
++
++static void
++gs_plugin_xbps_init (GsPluginXbps *self)
++{
++	self->owned = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++	self->info_cache = g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
++						  (GDestroyNotify) g_hash_table_unref);
++
++	/* Claim native-package apps after appstream has had a chance to
++	 * describe them. */
++	gs_plugin_add_rule (GS_PLUGIN (self), GS_PLUGIN_RULE_RUN_AFTER, "appstream");
++}
++
++/* ------------------------------------------------------------------------
++ * App construction
++ */
++
++/* Turn a package name into a stable, reverse-DNS AppStream id. The prefix
++ * keeps xbps components in their own namespace; characters which are not
++ * valid in an AppStream id are replaced rather than dropped so two package
++ * names never collapse to the same id. */
++static gchar *
++gs_plugin_xbps_app_id (const gchar *name)
++{
++	g_autoptr(GString) id = g_string_new (XBPS_APP_ID_PREFIX);
++
++	for (const gchar *p = name; p != NULL && *p != '\0'; p++) {
++		if (g_ascii_isalnum (*p) || *p == '.' || *p == '-' ||
++		    *p == '_' || *p == '+')
++			g_string_append_c (id, *p);
++		else
++			g_string_append_c (id, '_');
++	}
++
++	return g_string_free (g_steal_pointer (&id), FALSE);
++}
++
++/* Give an app created elsewhere (e.g. --details-pkg) the same identity and
++ * presentation as one created by list_apps(). Existing AppStream identity is
++ * never overwritten. */
++static void
++gs_plugin_xbps_app_ensure_identity (GsApp *app, const gchar *name)
++{
++	g_autofree gchar *id = NULL;
++
++	g_return_if_fail (GS_IS_APP (app));
++	g_return_if_fail (name != NULL);
++
++	if (gs_app_get_id (app) == NULL) {
++		id = gs_plugin_xbps_app_id (name);
++		gs_app_set_id (app, id);
++	}
++
++	if (gs_app_get_name (app) == NULL)
++		gs_app_set_name (app, GS_APP_QUALITY_LOWEST, name);
++
++	if (gs_app_get_kind (app) == AS_COMPONENT_KIND_UNKNOWN ||
++	    gs_app_get_kind (app) == AS_COMPONENT_KIND_GENERIC) {
++		gs_app_set_kind (app, AS_COMPONENT_KIND_DESKTOP_APP);
++		gs_app_add_quirk (app, GS_APP_QUIRK_NOT_LAUNCHABLE);
++	}
++
++	if (gs_app_get_bundle_kind (app) == AS_BUNDLE_KIND_UNKNOWN)
++		gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
++	if (gs_app_get_scope (app) == AS_COMPONENT_SCOPE_UNKNOWN)
++		gs_app_set_scope (app, AS_COMPONENT_SCOPE_SYSTEM);
++
++	if (gs_app_get_origin (app) == NULL) {
++		gs_app_set_origin (app, XBPS_ORIGIN);
++		gs_app_set_origin_ui (app, XBPS_ORIGIN_UI);
++	} else if (g_strcmp0 (gs_app_get_origin (app), XBPS_ORIGIN) == 0) {
++		/* Apps made from a full data-id already carry the machine
++		 * readable origin; make sure the UI never shows it raw. */
++		gs_app_set_origin_ui (app, XBPS_ORIGIN_UI);
++	}
++
++	if (!gs_app_has_icons (app))
++		gs_app_add_icon (app, G_ICON (g_themed_icon_new (XBPS_ICON_NAME)));
++}
++
++/* Returns a borrowed reference owned by the plugin cache. */
++static GsApp *
++gs_plugin_xbps_app_new (GsPluginXbps *self,
++			const gchar *name,
++			const gchar *version,
++			const gchar *summary,
++			GsAppState state)
++{
++	GsPlugin *plugin = GS_PLUGIN (self);
++	GsApp *app;
++
++	app = gs_plugin_cache_lookup (plugin, name);
++	if (app != NULL) {
++		/* Never downgrade an app which is already known to be installed. */
++		if (state == GS_APP_STATE_INSTALLED ||
++		    gs_app_get_state (app) == GS_APP_STATE_UNKNOWN)
++			gs_app_set_state (app, state);
++		gs_plugin_xbps_app_ensure_identity (app, name);
++		return app;
++	}
++
++	app = gs_app_new (NULL);
++	gs_app_add_source (app, name);
++	gs_app_add_source_id (app, name);
++	gs_app_set_management_plugin (app, plugin);
++	gs_plugin_xbps_app_ensure_identity (app, name);
++	gs_app_set_metadata (app, "GnomeSoftware::Creator", gs_plugin_get_name (plugin));
++	gs_app_set_name (app, GS_APP_QUALITY_LOWEST, name);
++	if (summary != NULL && *summary != '\0') {
++		gs_app_set_summary (app, GS_APP_QUALITY_LOWEST, summary);
++		gs_app_set_description (app, GS_APP_QUALITY_LOWEST, summary);
++	}
++	if (version != NULL && *version != '\0')
++		gs_app_set_version (app, version);
++	gs_app_set_state (app, state);
++
++	gs_plugin_cache_add (plugin, name, app);
++
++	return app;
++}
++
++static void
++gs_plugin_xbps_setup_async (GsPlugin *plugin,
++			    GCancellable *cancellable,
++			    GAsyncReadyCallback callback,
++			    gpointer user_data)
++{
++	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
++
++	g_task_set_source_tag (task, gs_plugin_xbps_setup_async);
++
++	if (!gs_xbps_is_available ()) {
++		g_debug ("xbps command line tools not found; disabling plugin");
++		gs_plugin_set_enabled (plugin, FALSE);
++	}
++
++	g_task_return_boolean (task, TRUE);
++}
++
++static gboolean
++gs_plugin_xbps_setup_finish (GsPlugin *plugin,
++			     GAsyncResult *result,
++			     GError **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++static void
++gs_plugin_xbps_adopt_app (GsPlugin *plugin, GsApp *app)
++{
++	GsPluginXbps *self = GS_PLUGIN_XBPS (plugin);
++	const gchar *source;
++	const gchar *id;
++	g_autofree gchar *derived_source = NULL;
++	gboolean cli_created;
++
++	/* Apps created from the command line (--details-pkg or --details with
++	 * a complete data-id) have no bundle/scope yet; everything else must
++	 * look like an installed-format package to be ours. */
++	cli_created = gs_app_get_bundle_kind (app) == AS_BUNDLE_KIND_UNKNOWN &&
++		      gs_app_get_scope (app) == AS_COMPONENT_SCOPE_UNKNOWN;
++	if (!cli_created &&
++	    (gs_app_get_bundle_kind (app) != AS_BUNDLE_KIND_PACKAGE ||
++	     gs_app_get_scope (app) != AS_COMPONENT_SCOPE_SYSTEM))
++		return;
++
++	source = gs_app_get_default_source (app);
++	id = gs_app_get_id (app);
++
++	/* A data-id carries our synthetic component id, but no source name. */
++	if ((source == NULL || *source == '\0') && id != NULL &&
++	    g_str_has_prefix (id, XBPS_APP_ID_PREFIX)) {
++		derived_source = g_strdup (id + strlen (XBPS_APP_ID_PREFIX));
++		if (!gs_xbps_package_is_owned (derived_source))
++			return;
++		gs_app_add_source (app, derived_source);
++		gs_app_add_source_id (app, derived_source);
++		source = gs_app_get_default_source (app);
++	}
++
++	if (source == NULL || *source == '\0')
++		return;
++
++	if (!g_hash_table_contains (self->owned, source)) {
++		if (!gs_xbps_package_is_owned (source))
++			return;
++		g_hash_table_add (self->owned, g_strdup (source));
++	}
++
++	gs_app_set_management_plugin (app, plugin);
++	gs_plugin_xbps_app_ensure_identity (app, source);
++
++	/* Command-line apps start out with no state at all. */
++	if (gs_app_get_state (app) == GS_APP_STATE_UNKNOWN) {
++		gs_app_set_state (app, gs_xbps_package_is_installed (source) ?
++				  GS_APP_STATE_INSTALLED : GS_APP_STATE_AVAILABLE);
++	}
++}
++
++/* ------------------------------------------------------------------------
++ * list_apps
++ */
++
++typedef struct {
++	GsAppQuery	*query;		/* (owned) */
++	GPtrArray	*updates;	/* (owned) (nullable), update query only */
++	GHashTable	*installed;	/* (owned) (nullable), update query only */
++} ListAppsData;
++
++static void
++list_apps_data_free (ListAppsData *data)
++{
++	g_clear_object (&data->query);
++	g_clear_pointer (&data->updates, g_ptr_array_unref);
++	g_clear_pointer (&data->installed, g_hash_table_unref);
++	g_free (data);
++}
++
++static void
++list_apps_return_unsupported (GTask *task)
++{
++	g_autoptr(GsAppList) empty = gs_app_list_new ();
++	g_task_return_pointer (task, g_steal_pointer (&empty), g_object_unref);
++}
++
++static void
++list_apps_installed_cb (GObject *source,
++			GAsyncResult *result,
++			gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	GsPluginXbps *self = g_task_get_source_object (task);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++	g_autoptr(GPtrArray) pkgs = NULL;
++	g_autoptr(GsAppList) list = gs_app_list_new ();
++
++	if (!gs_xbps_run_finish (result, &stdout_buf, &stderr_buf, &local_error)) {
++		g_task_return_error (task, g_steal_pointer (&local_error));
++		return;
++	}
++
++	pkgs = gs_xbps_parse_query_list (stdout_buf);
++	for (guint i = 0; i < pkgs->len; i++) {
++		GsXbpsPackage *pkg = g_ptr_array_index (pkgs, i);
++		GsApp *app = gs_plugin_xbps_app_new (self, pkg->name, pkg->version,
++						     pkg->summary, GS_APP_STATE_INSTALLED);
++		gs_app_list_add (list, app);
++	}
++
++	g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref);
++}
++
++static void
++list_apps_search_cb (GObject *source,
++		     GAsyncResult *result,
++		     gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	GsPluginXbps *self = g_task_get_source_object (task);
++	ListAppsData *data = g_task_get_task_data (task);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++	g_autoptr(GPtrArray) pkgs = NULL;
++	g_autoptr(GsAppList) list = gs_app_list_new ();
++	guint max_results = gs_app_query_get_max_results (data->query);
++
++	if (!gs_xbps_run_finish (result, &stdout_buf, &stderr_buf, &local_error)) {
++		g_task_return_error (task, g_steal_pointer (&local_error));
++		return;
++	}
++
++	pkgs = gs_xbps_parse_query_search (stdout_buf);
++	for (guint i = 0; i < pkgs->len; i++) {
++		GsXbpsPackage *pkg = g_ptr_array_index (pkgs, i);
++		GsApp *app;
++		GsAppState state;
++
++		if (max_results > 0 && gs_app_list_length (list) >= max_results)
++			break;
++
++		state = pkg->installed ? GS_APP_STATE_INSTALLED : GS_APP_STATE_AVAILABLE;
++		app = gs_plugin_xbps_app_new (self, pkg->name, pkg->version,
++					      pkg->summary, state);
++		gs_app_list_add (list, app);
++	}
++
++	g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref);
++}
++
++static void
++list_apps_updates_installed_cb (GObject *source,
++				GAsyncResult *result,
++				gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	GsPluginXbps *self = g_task_get_source_object (task);
++	ListAppsData *data = g_task_get_task_data (task);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++	g_autoptr(GPtrArray) installed_pkgs = NULL;
++	g_autoptr(GsAppList) list = gs_app_list_new ();
++
++	if (!gs_xbps_run_finish (result, &stdout_buf, &stderr_buf, &local_error)) {
++		g_task_return_error (task, g_steal_pointer (&local_error));
++		return;
++	}
++
++	installed_pkgs = gs_xbps_parse_query_list (stdout_buf);
++	for (guint i = 0; i < installed_pkgs->len; i++) {
++		GsXbpsPackage *pkg = g_ptr_array_index (installed_pkgs, i);
++		g_hash_table_insert (data->installed, g_strdup (pkg->name), pkg);
++		g_ptr_array_index (installed_pkgs, i) = NULL;
++	}
++
++	for (guint i = 0; i < data->updates->len; i++) {
++		GsXbpsPackage *update = g_ptr_array_index (data->updates, i);
++		GsXbpsPackage *installed = g_hash_table_lookup (data->installed, update->name);
++		GsApp *app;
++		g_autofree gchar *new_version = gs_xbps_pkgver_get_version (update->pkgver);
++
++		app = gs_plugin_xbps_app_new (self,
++					      update->name,
++					      installed != NULL ? installed->version : NULL,
++					      installed != NULL ? installed->summary : NULL,
++					      GS_APP_STATE_UPDATABLE);
++		gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
++		gs_app_set_update_version (app, new_version);
++		gs_app_list_add (list, app);
++	}
++
++	g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref);
++}
++
++static void
++list_apps_updates_cb (GObject *source,
++		      GAsyncResult *result,
++		      gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	ListAppsData *data = g_task_get_task_data (task);
++	GCancellable *cancellable = g_task_get_cancellable (task);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++	const gchar *argv[] = { XBPS_QUERY, "-l", NULL };
++
++	if (!gs_xbps_run_finish (result, &stdout_buf, &stderr_buf, &local_error)) {
++		g_task_return_error (task, g_steal_pointer (&local_error));
++		return;
++	}
++
++	data->updates = gs_xbps_parse_install_output (stdout_buf);
++	data->installed = g_hash_table_new_full (g_str_hash, g_str_equal,
++						 g_free, (GDestroyNotify) gs_xbps_package_free);
++
++	gs_xbps_run_async (argv, cancellable, list_apps_updates_installed_cb,
++			   g_steal_pointer (&task));
++}
++
++static void
++gs_plugin_xbps_list_apps_async (GsPlugin *plugin,
++				GsAppQuery *query,
++				GsPluginListAppsFlags flags,
++				GsPluginEventCallback event_callback,
++				void *event_user_data,
++				GCancellable *cancellable,
++				GAsyncReadyCallback callback,
++				gpointer user_data)
++{
++	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
++	ListAppsData *data = NULL;
++	const gchar * const *keywords = NULL;
++	GsAppQueryTristate is_installed;
++	GsAppQueryTristate is_for_update;
++
++	g_task_set_source_tag (task, gs_plugin_xbps_list_apps_async);
++
++	if (query == NULL || gs_app_query_get_n_properties_set (query) != 1) {
++		list_apps_return_unsupported (task);
++		return;
++	}
++
++	is_installed = gs_app_query_get_is_installed (query);
++	is_for_update = gs_app_query_get_is_for_update (query);
++	keywords = gs_app_query_get_keywords (query);
++
++	data = g_new0 (ListAppsData, 1);
++	data->query = g_object_ref (query);
++	g_task_set_task_data (task, data, (GDestroyNotify) list_apps_data_free);
++
++	if (keywords != NULL) {
++		const gchar *argv[] = { XBPS_QUERY, "-Rs", keywords[0], NULL };
++		if (keywords[0] == NULL || *keywords[0] == '\0') {
++			g_autoptr(GsAppList) empty = gs_app_list_new ();
++			g_task_return_pointer (task, g_steal_pointer (&empty), g_object_unref);
++			return;
++		}
++		gs_xbps_run_async (argv, cancellable, list_apps_search_cb,
++				   g_steal_pointer (&task));
++		return;
++	}
++
++	if (is_installed == GS_APP_QUERY_TRISTATE_TRUE) {
++		const gchar *argv[] = { XBPS_QUERY, "-l", NULL };
++		gs_xbps_run_async (argv, cancellable, list_apps_installed_cb,
++				   g_steal_pointer (&task));
++		return;
++	}
++
++	if (is_for_update == GS_APP_QUERY_TRISTATE_TRUE) {
++		/* A dry run is unprivileged and never prompts; it must stay
++		 * that way for cold-start prompt hygiene. */
++		const gchar *argv[] = { XBPS_INSTALL, "-nSu", NULL };
++		gs_xbps_run_async (argv, cancellable, list_apps_updates_cb,
++				   g_steal_pointer (&task));
++		return;
++	}
++
++	list_apps_return_unsupported (task);
++}
++
++static GsAppList *
++gs_plugin_xbps_list_apps_finish (GsPlugin *plugin,
++				 GAsyncResult *result,
++				 GError **error)
++{
++	return g_task_propagate_pointer (G_TASK (result), error);
++}
++
++/* ------------------------------------------------------------------------
++ * refine
++ */
++
++typedef struct {
++	GsAppList	*list;	/* (owned) */
++	guint		 index;
++} RefineData;
++
++static void
++refine_data_free (RefineData *data)
++{
++	g_clear_object (&data->list);
++	g_free (data);
++}
++
++static void
++refine_next (GTask *task);
++
++static void
++refine_apply_props (GsApp *app, GHashTable *props)
++{
++	const gchar *summary = g_hash_table_lookup (props, "short_desc");
++	const gchar *pkgver = g_hash_table_lookup (props, "pkgver");
++	const gchar *homepage = g_hash_table_lookup (props, "homepage");
++	const gchar *license = g_hash_table_lookup (props, "license");
++	const gchar *installed_size = g_hash_table_lookup (props, "installed_size");
++	const gchar *filename_size = g_hash_table_lookup (props, "filename-size");
++
++	if (summary != NULL && *summary != '\0') {
++		gs_app_set_summary (app, GS_APP_QUALITY_NORMAL, summary);
++		gs_app_set_description (app, GS_APP_QUALITY_NORMAL, summary);
++	}
++
++	if (pkgver != NULL) {
++		g_autofree gchar *version = gs_xbps_pkgver_get_version (pkgver);
++		if (*version != '\0')
++			gs_app_set_version (app, version);
++	}
++
++	if (homepage != NULL && *homepage != '\0')
++		gs_app_set_url (app, AS_URL_KIND_HOMEPAGE, homepage);
++
++	/* xbps allows non-SPDX "custom:" licences; AppStream consumers expect
++	 * an SPDX expression, so leave those unset rather than mislabel. */
++	if (license != NULL && *license != '\0' &&
++	    !g_str_has_prefix (license, "custom:"))
++		gs_app_set_license (app, GS_APP_QUALITY_NORMAL, license);
++
++	if (installed_size != NULL)
++		gs_app_set_size_installed (app, GS_SIZE_TYPE_VALID,
++					   gs_xbps_parse_size (installed_size));
++	if (filename_size != NULL)
++		gs_app_set_size_download (app, GS_SIZE_TYPE_VALID,
++					  gs_xbps_parse_size (filename_size));
++}
++
++static void
++refine_app_cb (GObject *source,
++	       GAsyncResult *result,
++	       gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	GsPluginXbps *self = g_task_get_source_object (task);
++	RefineData *data = g_task_get_task_data (task);
++	guint index = data->index - 1;
++	GsApp *app = gs_app_list_index (data->list, index);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++	g_autoptr(GHashTable) props = NULL;
++	const gchar *source_name = gs_app_get_default_source (app);
++
++	if (!gs_xbps_run_finish (result, &stdout_buf, &stderr_buf, &local_error)) {
++		/* Refinement is best-effort: a missing package in the cache
++		 * must not fail the whole list. */
++		g_debug ("Failed to query %s: %s", source_name, local_error->message);
++	} else {
++		props = gs_xbps_parse_info (stdout_buf);
++		refine_apply_props (app, props);
++		if (source_name != NULL && g_hash_table_size (props) > 0)
++			g_hash_table_insert (self->info_cache, g_strdup (source_name),
++					     g_steal_pointer (&props));
++	}
++
++	refine_next (g_steal_pointer (&task));
++}
++
++/* Consumes @task. */
++static void
++refine_next (GTask *task)
++{
++	GsPluginXbps *self = g_task_get_source_object (task);
++	RefineData *data = g_task_get_task_data (task);
++	GCancellable *cancellable = g_task_get_cancellable (task);
++
++	while (data->index < gs_app_list_length (data->list)) {
++		GsApp *app = gs_app_list_index (data->list, data->index++);
++		const gchar *source_name;
++		GHashTable *cached;
++
++		/* Command-line apps (e.g. --details=system/package/void/...)
++		 * arrive as wildcard apps and gs_plugin_loader_run_adopt()
++		 * skips those. Wildcards cannot be adopted in place, so build
++		 * a new app from the synthetic id; the wildcard is filtered
++		 * out by the refine job afterwards. */
++		if (!gs_app_has_management_plugin (app, GS_PLUGIN (self)) &&
++		    gs_app_has_quirk (app, GS_APP_QUIRK_IS_WILDCARD) &&
++		    gs_app_get_default_source (app) == NULL) {
++			const gchar *id = gs_app_get_id (app);
++
++			if (id != NULL && g_str_has_prefix (id, XBPS_APP_ID_PREFIX)) {
++				g_autofree gchar *name = g_strdup (id + strlen (XBPS_APP_ID_PREFIX));
++
++				if (gs_xbps_package_is_owned (name)) {
++					GsApp *new_app;
++					gboolean already_listed = FALSE;
++
++					new_app = gs_plugin_xbps_app_new (self, name, NULL, NULL,
++									  gs_xbps_package_is_installed (name) ?
++									  GS_APP_STATE_INSTALLED :
++									  GS_APP_STATE_AVAILABLE);
++					/* Keep the requested id so the unique id matches
++					 * the one app_create() is waiting for. */
++					gs_app_set_id (new_app, id);
++
++					for (guint i = 0; i < gs_app_list_length (data->list); i++) {
++						if (gs_app_list_index (data->list, i) == new_app) {
++							already_listed = TRUE;
++							break;
++						}
++					}
++					if (!already_listed)
++						gs_app_list_add (data->list, g_object_ref (new_app));
++
++					g_debug ("created app for xbps wildcard %s (package %s)",
++						 id, name);
++				}
++			}
++
++			continue;
++		}
++
++		if (!gs_app_has_management_plugin (app, GS_PLUGIN (self)))
++			continue;
++
++		source_name = gs_app_get_default_source (app);
++		if (source_name == NULL || *source_name == '\0')
++			continue;
++
++		gs_plugin_xbps_app_ensure_identity (app, source_name);
++
++		cached = g_hash_table_lookup (self->info_cache, source_name);
++		if (cached != NULL) {
++			refine_apply_props (app, cached);
++			continue;
++		}
++
++		{
++			const gchar *argv[] = { XBPS_QUERY, "-R", source_name, NULL };
++			gs_xbps_run_async (argv, cancellable, refine_app_cb,
++					   g_steal_pointer (&task));
++		}
++		return;
++	}
++
++	g_task_return_boolean (task, TRUE);
++	g_object_unref (task);
++}
++
++static void
++gs_plugin_xbps_refine_async (GsPlugin *plugin,
++			     GsAppList *list,
++			     GsPluginRefineFlags job_flags,
++			     GsPluginRefineRequireFlags require_flags,
++			     GsPluginEventCallback event_callback,
++			     void *event_user_data,
++			     GCancellable *cancellable,
++			     GAsyncReadyCallback callback,
++			     gpointer user_data)
++{
++	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
++	RefineData *data = g_new0 (RefineData, 1);
++
++	g_task_set_source_tag (task, gs_plugin_xbps_refine_async);
++
++	data->list = g_object_ref (list);
++	g_task_set_task_data (task, data, (GDestroyNotify) refine_data_free);
++
++	refine_next (g_steal_pointer (&task));
++}
++
++static gboolean
++gs_plugin_xbps_refine_finish (GsPlugin *plugin,
++			      GAsyncResult *result,
++			      GError **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++/* ------------------------------------------------------------------------
++ * install / uninstall / update
++ */
++
++typedef struct {
++	GPtrArray		*names;		/* (owned) */
++	GsAppList		*apps;		/* (owned) */
++	GsPluginProgressCallback	 progress_callback;
++	gpointer		 progress_user_data;
++	GsAppState		 pending_state;
++	GsAppState		 done_state;
++	gboolean		 is_update;
++} OpData;
++
++static void
++op_data_free (OpData *data)
++{
++	g_clear_pointer (&data->names, g_ptr_array_unref);
++	g_clear_object (&data->apps);
++	g_free (data);
++}
++
++static gchar *
++format_operation_error (const gchar *stdout_buf,
++			const gchar *stderr_buf,
++			const GError *error)
++{
++	const gchar *detail = NULL;
++
++	if (stderr_buf != NULL && *stderr_buf != '\0')
++		detail = stderr_buf;
++	else if (stdout_buf != NULL && *stdout_buf != '\0')
++		detail = stdout_buf;
++	else if (error != NULL)
++		detail = error->message;
++
++	if (detail == NULL || *detail == '\0')
++		return g_strdup ("The xbps command failed");
++
++	return g_strdup (detail);
++}
++
++static void
++operation_cb (GObject *source,
++	      GAsyncResult *result,
++	      gpointer user_data)
++{
++	g_autoptr(GTask) task = user_data;
++	GsPluginXbps *self = g_task_get_source_object (task);
++	GsPlugin *plugin = GS_PLUGIN (self);
++	OpData *data = g_task_get_task_data (task);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++
++	if (!gs_xbps_run_finish (result, &stdout_buf, &stderr_buf, &local_error)) {
++		g_autofree gchar *message = format_operation_error (stdout_buf, stderr_buf, local_error);
++
++		for (guint i = 0; i < gs_app_list_length (data->apps); i++)
++			gs_app_set_state_recover (gs_app_list_index (data->apps, i));
++
++		if (data->progress_callback != NULL)
++			data->progress_callback (plugin, 0, data->progress_user_data);
++
++		if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
++			g_task_return_new_error (task, GS_PLUGIN_ERROR,
++						 GS_PLUGIN_ERROR_CANCELLED,
++						 "Operation cancelled");
++			return;
++		}
++
++		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
++					 "%s", message);
++		return;
++	}
++
++	/* Drop cached details for the affected packages so the next refine
++	 * picks up the new version/size. */
++	for (guint i = 0; i < data->names->len; i++)
++		g_hash_table_remove (self->info_cache, g_ptr_array_index (data->names, i));
++
++	for (guint i = 0; i < gs_app_list_length (data->apps); i++) {
++		GsApp *app = gs_app_list_index (data->apps, i);
++		gs_app_set_state (app, data->done_state);
++		if (data->is_update)
++			gs_app_set_update_version (app, NULL);
++	}
++
++	if (data->progress_callback != NULL)
++		data->progress_callback (plugin, 100, data->progress_user_data);
++
++	if (data->is_update)
++		gs_plugin_updates_changed (plugin);
++
++	g_task_return_boolean (task, TRUE);
++}
++
++/* Consumes @task. */
++static void
++start_operation (GTask *task,
++		 const gchar *binary,
++		 const gchar * const *opts,
++		 gboolean system_update)
++{
++	GsPluginXbps *self = g_task_get_source_object (task);
++	GsPlugin *plugin = GS_PLUGIN (self);
++	OpData *data = g_task_get_task_data (task);
++	GCancellable *cancellable = g_task_get_cancellable (task);
++	g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
++
++	g_ptr_array_add (argv, g_strdup (PKEXEC));
++	g_ptr_array_add (argv, g_strdup (binary));
++	for (guint i = 0; opts[i] != NULL; i++)
++		g_ptr_array_add (argv, g_strdup (opts[i]));
++	g_ptr_array_add (argv, g_strdup ("--"));
++
++	if (!system_update) {
++		for (guint i = 0; i < data->names->len; i++)
++			g_ptr_array_add (argv, g_strdup (g_ptr_array_index (data->names, i)));
++	}
++	g_ptr_array_add (argv, NULL);
++
++	if (data->progress_callback != NULL)
++		data->progress_callback (plugin, 0, data->progress_user_data);
++
++	for (guint i = 0; i < gs_app_list_length (data->apps); i++) {
++		GsApp *app = gs_app_list_index (data->apps, i);
++		gs_app_set_state (app, data->pending_state);
++	}
++
++	gs_xbps_run_async ((const gchar * const *) argv->pdata, cancellable,
++			   operation_cb, g_steal_pointer (&task));
++}
++
++static void
++collect_operation_data (GTask *task, GsAppList *apps, GsAppState pending_state,
++			GsAppState done_state, gboolean is_update)
++{
++	GsPluginXbps *self = g_task_get_source_object (task);
++	GsPlugin *plugin = GS_PLUGIN (self);
++	OpData *data = g_new0 (OpData, 1);
++
++	data->names = g_ptr_array_new_with_free_func (g_free);
++	data->apps = g_object_ref (apps);
++	data->pending_state = pending_state;
++	data->done_state = done_state;
++	data->is_update = is_update;
++
++	for (guint i = 0; i < gs_app_list_length (apps); i++) {
++		GsApp *app = gs_app_list_index (apps, i);
++		const gchar *source_name;
++
++		if (!gs_app_has_management_plugin (app, plugin))
++			continue;
++		source_name = gs_app_get_default_source (app);
++		if (source_name == NULL || *source_name == '\0')
++			continue;
++		g_ptr_array_add (data->names, g_strdup (source_name));
++	}
++
++	g_task_set_task_data (task, data, (GDestroyNotify) op_data_free);
++}
++
++static void
++gs_plugin_xbps_install_apps_async (GsPlugin *plugin,
++				   GsAppList *apps,
++				   GsPluginInstallAppsFlags flags,
++				   GsPluginProgressCallback progress_callback,
++				   gpointer progress_user_data,
++				   GsPluginEventCallback event_callback,
++				   void *event_user_data,
++				   GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
++				   gpointer app_needs_user_action_data,
++				   GCancellable *cancellable,
++				   GAsyncReadyCallback callback,
++				   gpointer user_data)
++{
++	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
++	static const gchar *opts[] = { "--yes", NULL };
++	OpData *data;
++
++	g_task_set_source_tag (task, gs_plugin_xbps_install_apps_async);
++	collect_operation_data (task, apps, GS_APP_STATE_INSTALLING,
++				GS_APP_STATE_INSTALLED, FALSE);
++	data = g_task_get_task_data (task);
++	data->progress_callback = progress_callback;
++	data->progress_user_data = progress_user_data;
++
++	if (data->names->len == 0) {
++		g_task_return_boolean (task, TRUE);
++		return;
++	}
++
++	start_operation (g_steal_pointer (&task), XBPS_INSTALL, opts, FALSE);
++}
++
++static gboolean
++gs_plugin_xbps_install_apps_finish (GsPlugin *plugin,
++				    GAsyncResult *result,
++				    GError **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++static void
++gs_plugin_xbps_uninstall_apps_async (GsPlugin *plugin,
++				     GsAppList *apps,
++				     GsPluginUninstallAppsFlags flags,
++				     GsPluginProgressCallback progress_callback,
++				     gpointer progress_user_data,
++				     GsPluginEventCallback event_callback,
++				     void *event_user_data,
++				     GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
++				     gpointer app_needs_user_action_data,
++				     GCancellable *cancellable,
++				     GAsyncReadyCallback callback,
++				     gpointer user_data)
++{
++	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
++	static const gchar *opts[] = { "--yes", "--recursive", NULL };
++	OpData *data;
++
++	g_task_set_source_tag (task, gs_plugin_xbps_uninstall_apps_async);
++	collect_operation_data (task, apps, GS_APP_STATE_REMOVING,
++				GS_APP_STATE_AVAILABLE, FALSE);
++	data = g_task_get_task_data (task);
++	data->progress_callback = progress_callback;
++	data->progress_user_data = progress_user_data;
++
++	if (data->names->len == 0) {
++		g_task_return_boolean (task, TRUE);
++		return;
++	}
++
++	start_operation (g_steal_pointer (&task), XBPS_REMOVE, opts, FALSE);
++}
++
++static gboolean
++gs_plugin_xbps_uninstall_apps_finish (GsPlugin *plugin,
++				      GAsyncResult *result,
++				      GError **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++static void
++gs_plugin_xbps_update_apps_async (GsPlugin *plugin,
++				  GsAppList *apps,
++				  GsPluginUpdateAppsFlags flags,
++				  GsPluginProgressCallback progress_callback,
++				  gpointer progress_user_data,
++				  GsPluginEventCallback event_callback,
++				  void *event_user_data,
++				  GsPluginAppNeedsUserActionCallback app_needs_user_action_callback,
++				  gpointer app_needs_user_action_data,
++				  GCancellable *cancellable,
++				  GAsyncReadyCallback callback,
++				  gpointer user_data)
++{
++	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
++	/* argv1 is --sync (not a bare -Sy): a full transaction, one prompt. */
++	static const gchar *opts[] = { "--sync", "--update", "--yes", NULL };
++	OpData *data;
++	gboolean system_update;
++
++	g_task_set_source_tag (task, gs_plugin_xbps_update_apps_async);
++	collect_operation_data (task, apps, GS_APP_STATE_INSTALLING,
++				GS_APP_STATE_INSTALLED, TRUE);
++	data = g_task_get_task_data (task);
++	data->progress_callback = progress_callback;
++	data->progress_user_data = progress_user_data;
++
++	/* An empty list means "update everything". */
++	system_update = (data->names->len == 0);
++
++	start_operation (g_steal_pointer (&task), XBPS_INSTALL, opts, system_update);
++}
++
++static gboolean
++gs_plugin_xbps_update_apps_finish (GsPlugin *plugin,
++				   GAsyncResult *result,
++				   GError **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++/* ------------------------------------------------------------------------
++ * type registration
++ */
++
++static void
++gs_plugin_xbps_class_init (GsPluginXbpsClass *klass)
++{
++	GObjectClass *object_class = G_OBJECT_CLASS (klass);
++	GsPluginClass *plugin_class = GS_PLUGIN_CLASS (klass);
++
++	object_class->finalize = gs_plugin_xbps_finalize;
++
++	plugin_class->setup_async = gs_plugin_xbps_setup_async;
++	plugin_class->setup_finish = gs_plugin_xbps_setup_finish;
++	plugin_class->adopt_app = gs_plugin_xbps_adopt_app;
++	plugin_class->refine_async = gs_plugin_xbps_refine_async;
++	plugin_class->refine_finish = gs_plugin_xbps_refine_finish;
++	plugin_class->list_apps_async = gs_plugin_xbps_list_apps_async;
++	plugin_class->list_apps_finish = gs_plugin_xbps_list_apps_finish;
++	plugin_class->install_apps_async = gs_plugin_xbps_install_apps_async;
++	plugin_class->install_apps_finish = gs_plugin_xbps_install_apps_finish;
++	plugin_class->uninstall_apps_async = gs_plugin_xbps_uninstall_apps_async;
++	plugin_class->uninstall_apps_finish = gs_plugin_xbps_uninstall_apps_finish;
++	plugin_class->update_apps_async = gs_plugin_xbps_update_apps_async;
++	plugin_class->update_apps_finish = gs_plugin_xbps_update_apps_finish;
++}
++
++GType
++gs_plugin_query_type (void)
++{
++	return GS_TYPE_PLUGIN_XBPS;
++}
+diff --git a/plugins/xbps/gs-plugin-xbps.h b/plugins/xbps/gs-plugin-xbps.h
+new file mode 100644
+index 0000000..f023a77
+--- /dev/null
++++ b/plugins/xbps/gs-plugin-xbps.h
+@@ -0,0 +1,22 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
++ * vi:set noexpandtab tabstop=8 shiftwidth=8:
++ *
++ * Copyright (C) 2026 Void Linux Stores
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <glib.h>
++#include <glib-object.h>
++
++#include <gnome-software.h>
++
++G_BEGIN_DECLS
++
++#define GS_TYPE_PLUGIN_XBPS (gs_plugin_xbps_get_type ())
++
++G_DECLARE_FINAL_TYPE (GsPluginXbps, gs_plugin_xbps, GS, PLUGIN_XBPS, GsPlugin)
++
++G_END_DECLS
+diff --git a/plugins/xbps/gs-xbps-utils.c b/plugins/xbps/gs-xbps-utils.c
+new file mode 100644
+index 0000000..736824f
+--- /dev/null
++++ b/plugins/xbps/gs-xbps-utils.c
+@@ -0,0 +1,433 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
++ * vi:set noexpandtab tabstop=8 shiftwidth=8:
++ *
++ * Copyright (C) 2026 Void Linux Stores
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include <config.h>
++
++#include <gio/gio.h>
++#include <glib.h>
++#include <string.h>
++
++#include "gs-xbps-utils.h"
++
++GsXbpsPackage *
++gs_xbps_package_new (const gchar *pkgver, const gchar *summary, gboolean installed)
++{
++	GsXbpsPackage *pkg = g_new0 (GsXbpsPackage, 1);
++
++	pkg->pkgver = g_strdup (pkgver);
++	pkg->name = gs_xbps_pkgver_get_name (pkgver);
++	pkg->version = gs_xbps_pkgver_get_version (pkgver);
++	pkg->summary = g_strdup (summary);
++	pkg->installed = installed;
++
++	return pkg;
++}
++
++void
++gs_xbps_package_free (GsXbpsPackage *pkg)
++{
++	if (pkg == NULL)
++		return;
++	g_free (pkg->name);
++	g_free (pkg->pkgver);
++	g_free (pkg->version);
++	g_free (pkg->summary);
++	g_free (pkg);
++}
++
++/* The pkgname may itself contain '-', so the split point is the last '-'
++ * which is followed by a version containing no further '-'. This matches
++ * xbps-uhelper getpkgname on the full installed set. */
++gchar *
++gs_xbps_pkgver_get_name (const gchar *pkgver)
++{
++	const gchar *p;
++
++	g_return_val_if_fail (pkgver != NULL, NULL);
++
++	for (p = pkgver; *p != '\0'; p++) {
++		if (*p == '-' && g_ascii_isdigit (p[1]) &&
++		    strchr (p + 1, '-') == NULL)
++			return g_strndup (pkgver, p - pkgver);
++	}
++
++	return g_strdup (pkgver);
++}
++
++gchar *
++gs_xbps_pkgver_get_version (const gchar *pkgver)
++{
++	g_autofree gchar *name = NULL;
++
++	g_return_val_if_fail (pkgver != NULL, NULL);
++
++	name = gs_xbps_pkgver_get_name (pkgver);
++	if (g_strcmp0 (name, pkgver) == 0 || pkgver[strlen (name)] != '-')
++		return g_strdup ("");
++
++	return g_strdup (pkgver + strlen (name) + 1);
++}
++
++guint64
++gs_xbps_parse_size (const gchar *size_str)
++{
++	gchar *end = NULL;
++	guint64 value;
++	guint64 multiplier = 1;
++
++	if (size_str == NULL)
++		return 0;
++
++	value = g_ascii_strtoull (size_str, &end, 10);
++	if (end == size_str)
++		return 0;
++
++	while (g_ascii_isspace (*end))
++		end++;
++
++	switch (g_ascii_toupper (*end)) {
++	case 'K':
++		multiplier = 1024ULL;
++		break;
++	case 'M':
++		multiplier = 1024ULL * 1024ULL;
++		break;
++	case 'G':
++		multiplier = 1024ULL * 1024ULL * 1024ULL;
++		break;
++	case 'T':
++		multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
++		break;
++	default:
++		break;
++	}
++
++	return value * multiplier;
++}
++
++/* Duplicate the next whitespace-delimited token of @line and return a
++ * pointer to the start of the following token (or the terminating NUL). */
++static gchar *
++token_dup (const gchar *line, const gchar **rest_out)
++{
++	const gchar *start = line;
++	const gchar *end;
++
++	while (g_ascii_isspace (*start))
++		start++;
++	end = start;
++	while (*end != '\0' && !g_ascii_isspace (*end))
++		end++;
++
++	if (rest_out != NULL) {
++		const gchar *rest = end;
++		while (g_ascii_isspace (*rest))
++			rest++;
++		*rest_out = rest;
++	}
++
++	return g_strndup (start, end - start);
++}
++
++GPtrArray *
++gs_xbps_parse_query_list (const gchar *output)
++{
++	g_autoptr(GPtrArray) pkgs = g_ptr_array_new_with_free_func ((GDestroyNotify) gs_xbps_package_free);
++	g_auto(GStrv) lines = g_strsplit (output != NULL ? output : "", "\n", -1);
++
++	/* Format: "ii <pkgver>   <short_desc>". `xbps-query -l` only lists
++	 * installed packages; the two state characters are informational. */
++	for (guint i = 0; lines[i] != NULL; i++) {
++		const gchar *rest = lines[i];
++		g_autofree gchar *flags = NULL;
++		g_autofree gchar *pkgver = NULL;
++
++		if (lines[i][0] == '\0')
++			continue;
++
++		flags = token_dup (rest, &rest);
++		if (*flags == '\0')
++			continue;
++		pkgver = token_dup (rest, &rest);
++		if (*pkgver == '\0')
++			continue;
++
++		g_ptr_array_add (pkgs, gs_xbps_package_new (pkgver, rest, TRUE));
++	}
++
++	return g_steal_pointer (&pkgs);
++}
++
++GPtrArray *
++gs_xbps_parse_query_search (const gchar *output)
++{
++	g_autoptr(GPtrArray) pkgs = g_ptr_array_new_with_free_func ((GDestroyNotify) gs_xbps_package_free);
++	g_auto(GStrv) lines = g_strsplit (output != NULL ? output : "", "\n", -1);
++
++	/* Format: "[*] <pkgver>   <short_desc>" (installed) or "[-] ...". */
++	for (guint i = 0; lines[i] != NULL; i++) {
++		const gchar *line = lines[i];
++		const gchar *close;
++		const gchar *rest;
++		gboolean installed;
++		g_autofree gchar *pkgver = NULL;
++
++		if (line[0] != '[')
++			continue;
++		close = strchr (line, ']');
++		if (close == NULL)
++			continue;
++
++		installed = (line[1] == '*');
++
++		rest = close + 1;
++		pkgver = token_dup (rest, &rest);
++		if (*pkgver == '\0')
++			continue;
++
++		g_ptr_array_add (pkgs, gs_xbps_package_new (pkgver, rest, installed));
++	}
++
++	return g_steal_pointer (&pkgs);
++}
++
++GPtrArray *
++gs_xbps_parse_install_output (const gchar *output)
++{
++	g_autoptr(GPtrArray) pkgs = g_ptr_array_new_with_free_func ((GDestroyNotify) gs_xbps_package_free);
++	g_auto(GStrv) lines = g_strsplit (output != NULL ? output : "", "\n", -1);
++
++	/* Format: "<pkgver> <action> <arch> <repo> <dlsize> <instsize>" */
++	for (guint i = 0; lines[i] != NULL; i++) {
++		const gchar *rest = lines[i];
++		g_autofree gchar *pkgver = NULL;
++		g_autofree gchar *action = NULL;
++
++		if (lines[i][0] == '\0')
++			continue;
++
++		pkgver = token_dup (rest, &rest);
++		if (*pkgver == '\0')
++			continue;
++		action = token_dup (rest, &rest);
++		if (g_strcmp0 (action, "update") != 0)
++			continue;
++
++		g_ptr_array_add (pkgs, gs_xbps_package_new (pkgver, NULL, FALSE));
++	}
++
++	return g_steal_pointer (&pkgs);
++}
++
++GHashTable *
++gs_xbps_parse_info (const gchar *output)
++{
++	g_autoptr(GHashTable) props = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
++	g_auto(GStrv) lines = g_strsplit (output != NULL ? output : "", "\n", -1);
++
++	for (guint i = 0; lines[i] != NULL; i++) {
++		const gchar *line = lines[i];
++		const gchar *colon;
++		g_autofree gchar *key = NULL;
++		gchar *value;
++
++		/* Multi-line values (provides, run_depends, …) are continuations
++		 * and are not needed for refinement. */
++		if (line[0] == '\0' || g_ascii_isspace (line[0]))
++			continue;
++
++		colon = strchr (line, ':');
++		if (colon == NULL)
++			continue;
++
++		key = g_strndup (line, colon - line);
++		value = g_strdup (colon + 1);
++		g_strstrip (value);
++		g_hash_table_replace (props, g_steal_pointer (&key), value);
++	}
++
++	return g_steal_pointer (&props);
++}
++
++gboolean
++gs_xbps_is_available (void)
++{
++	return g_file_test ("/usr/bin/xbps-query", G_FILE_TEST_IS_EXECUTABLE) &&
++	       g_file_test ("/usr/bin/xbps-install", G_FILE_TEST_IS_EXECUTABLE) &&
++	       g_file_test ("/usr/bin/xbps-remove", G_FILE_TEST_IS_EXECUTABLE);
++}
++
++gboolean
++gs_xbps_package_is_owned (const gchar *name)
++{
++	const gchar *argv[] = { "/usr/bin/xbps-query", "-R", name, NULL };
++	g_autoptr(GSubprocess) subprocess = NULL;
++	g_autoptr(GError) local_error = NULL;
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++
++	g_return_val_if_fail (name != NULL, FALSE);
++
++	subprocess = g_subprocess_newv (argv,
++					G_SUBPROCESS_FLAGS_STDOUT_PIPE |
++					G_SUBPROCESS_FLAGS_STDERR_PIPE,
++					&local_error);
++	if (subprocess == NULL) {
++		g_debug ("Failed to run xbps-query: %s", local_error->message);
++		return FALSE;
++	}
++
++	if (!g_subprocess_communicate_utf8 (subprocess, NULL, NULL,
++					    &stdout_buf, &stderr_buf, &local_error)) {
++		g_debug ("Failed to run xbps-query: %s", local_error->message);
++		return FALSE;
++	}
++
++	return g_subprocess_get_successful (subprocess);
++}
++
++/* `xbps-query -S` succeeds only when the package is registered in the
++ * package database; `-R` would also succeed for packages that are merely
++ * available from a repository. */
++gboolean
++gs_xbps_package_is_installed (const gchar *name)
++{
++	const gchar *argv[] = { "/usr/bin/xbps-query", "-S", name, NULL };
++	g_autoptr(GSubprocess) subprocess = NULL;
++	g_autoptr(GError) local_error = NULL;
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++
++	g_return_val_if_fail (name != NULL, FALSE);
++
++	subprocess = g_subprocess_newv (argv,
++					G_SUBPROCESS_FLAGS_STDOUT_PIPE |
++					G_SUBPROCESS_FLAGS_STDERR_PIPE,
++					&local_error);
++	if (subprocess == NULL) {
++		g_debug ("Failed to run xbps-query: %s", local_error->message);
++		return FALSE;
++	}
++
++	if (!g_subprocess_communicate_utf8 (subprocess, NULL, NULL,
++					    &stdout_buf, &stderr_buf, &local_error)) {
++		g_debug ("Failed to run xbps-query: %s", local_error->message);
++		return FALSE;
++	}
++
++	return g_subprocess_get_successful (subprocess);
++}
++
++void
++gs_xbps_run_async (const gchar * const *argv,
++		   GCancellable *cancellable,
++		   GAsyncReadyCallback callback,
++		   gpointer user_data)
++{
++	g_autoptr(GSubprocessLauncher) launcher = NULL;
++	g_autoptr(GSubprocess) subprocess = NULL;
++	g_autoptr(GError) local_error = NULL;
++
++	g_return_if_fail (argv != NULL && argv[0] != NULL);
++
++	launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
++					      G_SUBPROCESS_FLAGS_STDERR_PIPE);
++	/* Keep diagnostics parseable regardless of the user's locale. */
++	g_subprocess_launcher_setenv (launcher, "LC_ALL", "C", TRUE);
++
++	subprocess = g_subprocess_launcher_spawnv (launcher, argv, &local_error);
++	if (subprocess == NULL) {
++		g_autoptr(GTask) task = g_task_new (NULL, cancellable, callback, user_data);
++		g_task_set_source_tag (task, gs_xbps_run_async);
++		g_task_return_error (task, g_steal_pointer (&local_error));
++		return;
++	}
++
++	g_subprocess_communicate_utf8_async (subprocess, NULL, cancellable,
++					     callback, user_data);
++}
++
++gboolean
++gs_xbps_run_finish (GAsyncResult *result,
++		    gchar **out_stdout,
++		    gchar **out_stderr,
++		    GError **error)
++{
++	g_autoptr(GObject) source = g_async_result_get_source_object (result);
++	GSubprocess *subprocess = NULL;
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	gboolean success;
++
++	g_return_val_if_fail (G_IS_ASYNC_RESULT (result), FALSE);
++
++	if (out_stdout != NULL)
++		*out_stdout = NULL;
++	if (out_stderr != NULL)
++		*out_stderr = NULL;
++
++	/* No source object: the subprocess was never spawned. */
++	if (source == NULL)
++		return g_task_propagate_boolean (G_TASK (result), error);
++
++	subprocess = G_SUBPROCESS (source);
++	success = g_subprocess_communicate_utf8_finish (subprocess, result,
++							&stdout_buf, &stderr_buf,
++							error);
++
++	/* communicate_utf8_finish() returns TRUE once both pipes have been
++	 * drained, no matter how the child exited, so the exit status has to
++	 * be checked separately. Without this a refused pkexec prompt (126 or
++	 * 127) or a failed xbps transaction is reported to the caller as a
++	 * successful operation. */
++	if (success && !g_subprocess_get_successful (subprocess)) {
++		g_autofree gchar *detail = NULL;
++		g_autofree gchar *message = NULL;
++		gint exit_status = -1;
++		GIOErrorEnum error_code = G_IO_ERROR_FAILED;
++
++		if (g_subprocess_get_if_exited (subprocess))
++			exit_status = g_subprocess_get_exit_status (subprocess);
++
++		if (exit_status == 126 || exit_status == 127) {
++			/* pkexec: the polkit prompt was dismissed or refused. */
++			error_code = G_IO_ERROR_PERMISSION_DENIED;
++			message = g_strdup_printf ("xbps was not authorized "
++						   "(exit status %d)", exit_status);
++		} else if (exit_status >= 0) {
++			message = g_strdup_printf ("xbps command failed "
++						   "with exit status %d", exit_status);
++		} else {
++			message = g_strdup_printf ("xbps command was terminated "
++						   "by signal %d",
++						   g_subprocess_get_term_sig (subprocess));
++		}
++
++		/* Keep the tool's own diagnostics: the list and refine
++		 * paths only log the GError message. */
++		if (stderr_buf != NULL && *stderr_buf != '\0')
++			detail = g_strstrip (g_strdup (stderr_buf));
++
++		if (detail != NULL && *detail != '\0') {
++			g_set_error (error, G_IO_ERROR, error_code,
++				     "%s: %s", message, detail);
++		} else {
++			g_set_error_literal (error, G_IO_ERROR, error_code,
++					     message);
++		}
++
++		success = FALSE;
++	}
++
++	if (out_stdout != NULL)
++		*out_stdout = g_steal_pointer (&stdout_buf);
++	if (out_stderr != NULL)
++		*out_stderr = g_steal_pointer (&stderr_buf);
++
++	return success;
++}
+diff --git a/plugins/xbps/gs-xbps-utils.h b/plugins/xbps/gs-xbps-utils.h
+new file mode 100644
+index 0000000..90b4543
+--- /dev/null
++++ b/plugins/xbps/gs-xbps-utils.h
+@@ -0,0 +1,54 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
++ * vi:set noexpandtab tabstop=8 shiftwidth=8:
++ *
++ * Copyright (C) 2026 Void Linux Stores
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <gio/gio.h>
++
++G_BEGIN_DECLS
++
++typedef struct {
++	gchar		*name;		/* e.g. "libfoo" */
++	gchar		*pkgver;	/* e.g. "libfoo-1.2.3_1" */
++	gchar		*version;	/* e.g. "1.2.3_1" */
++	gchar		*summary;	/* (nullable) */
++	gboolean	 installed;
++} GsXbpsPackage;
++
++GsXbpsPackage	*gs_xbps_package_new		(const gchar	*pkgver,
++						 const gchar	*summary,
++						 gboolean	 installed);
++void		 gs_xbps_package_free		(GsXbpsPackage	*pkg);
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (GsXbpsPackage, gs_xbps_package_free)
++
++gchar		*gs_xbps_pkgver_get_name	(const gchar	*pkgver);
++gchar		*gs_xbps_pkgver_get_version	(const gchar	*pkgver);
++
++guint64		 gs_xbps_parse_size		(const gchar	*size_str);
++
++/* Parsers; returned arrays have free func gs_xbps_package_free. */
++GPtrArray	*gs_xbps_parse_query_list	(const gchar	*output);
++GPtrArray	*gs_xbps_parse_query_search	(const gchar	*output);
++GPtrArray	*gs_xbps_parse_install_output	(const gchar	*output);
++/* key -> value map of an `xbps-query -R` result. */
++GHashTable	*gs_xbps_parse_info		(const gchar	*output);
++
++gboolean	 gs_xbps_is_available		(void);
++gboolean	 gs_xbps_package_is_owned	(const gchar	*name);
++gboolean	 gs_xbps_package_is_installed	(const gchar	*name);
++
++void		 gs_xbps_run_async		(const gchar * const *argv,
++						 GCancellable	*cancellable,
++						 GAsyncReadyCallback callback,
++						 gpointer	user_data);
++gboolean	 gs_xbps_run_finish		(GAsyncResult	*result,
++						 gchar		**out_stdout,
++						 gchar		**out_stderr,
++						 GError		**error);
++
++G_END_DECLS
+diff --git a/plugins/xbps/meson.build b/plugins/xbps/meson.build
+new file mode 100644
+index 0000000..e930e94
+--- /dev/null
++++ b/plugins/xbps/meson.build
+@@ -0,0 +1,13 @@
++cargs = ['-DG_LOG_DOMAIN="GsPluginXbps"']
++
++shared_module(
++  'gs_plugin_xbps',
++  sources : [
++    'gs-plugin-xbps.c',
++    'gs-xbps-utils.c',
++  ],
++  install : true,
++  install_dir : plugin_dir,
++  c_args : cargs,
++  dependencies : [plugin_libs],
++)

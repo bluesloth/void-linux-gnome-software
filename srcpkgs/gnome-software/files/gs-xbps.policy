@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop.org//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>GNOME Software</vendor>
+  <vendor_url>https://apps.gnome.org/Software/</vendor_url>
+  <icon_name>system-software-install</icon_name>
+  <action id="org.gnome.Software.xbps.install">
+    <description>Install xbps packages with GNOME Software</description>
+    <message>Authentication is required to install software</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/xbps-install</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--yes</annotate>
+  </action>
+  <action id="org.gnome.Software.xbps.remove">
+    <description>Remove xbps packages with GNOME Software</description>
+    <message>Authentication is required to remove software</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/xbps-remove</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--yes</annotate>
+  </action>
+  <action id="org.gnome.Software.xbps.update">
+    <description>Update the system with GNOME Software</description>
+    <message>Authentication is required to update the system</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/xbps-install</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--sync</annotate>
+  </action>
+</policyconfig>
