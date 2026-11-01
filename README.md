@@ -5,14 +5,19 @@ source **and** the served binary repository for this store.
 One repository per store: KDE Discover lives in `private/void-linux-discover/`,
 cosmic-store in `private/void-linux-cosmic/` (epoch-managed).
 
-## Status: rev7 PUBLISHED — `stores-r4` served from GitHub Pages (2026-10-30)
+## Status: rev8 PUBLISHED — `stores-r5` served from GitHub Pages (2026-11-01)
 
 The plugin is written, meson-wired, patch-extracted, compiled and **validated on
-a real Void GNOME DE + GDM box**. rev7 is
-`gnome-software-50.2_7.x86_64.xbps` (2684150 B, sha256 `ed078a16…2220`), the
-plugin md5 is `22268a79…888f`, and the patch is 1595 lines, sha256
-`b23e9995…c4bc`. rev7's only source change: a query the backend cannot serve
-now returns an empty `GsAppList` instead of `G_IO_ERROR_NOT_SUPPORTED`.
+a real Void GNOME DE + GDM box**. rev8 is
+`gnome-software-50.2_8.x86_64.xbps` (2684132 B, sha256 `379d14be…aaf6`), the
+plugin md5 is `22268a79…888f` (**identical to rev7 — rev8 is policy data
+only**), and the patch is 1595 lines, sha256 `b23e9995…c4bc`. rev7's only
+source change: a query the backend cannot serve now returns an empty
+`GsAppList` instead of `G_IO_ERROR_NOT_SUPPORTED`. rev8's only change: the
+`install`/`update` polkit actions annotate `/usr/local/sbin/void-xbps-snap`,
+the wrapper the `xbps-install` symlinks resolve to on an
+installer-provisioned box, so the prompt shows this store's own wording
+instead of pkexec's generic raw-argv fallback.
 
 The important design change since the first build is that the backend **no
 longer depends on AppStream catalogs**: it builds a `GsApp` per xbps package
@@ -23,9 +28,9 @@ categories stay empty without catalogs — accepted; search, installed, updates
 and details are the xbps surface. The `gs_xbps_run_finish()` exit-status fix
 from the first build is retained (126/127 → `G_IO_ERROR_PERMISSION_DENIED`).
 
-`srcpkgs/gnome-software/` carries the template (`revision=7`, `-Dxbps=true`),
+`srcpkgs/gnome-software/` carries the template (`revision=8`, `-Dxbps=true`),
 the `auth_admin` policy, and `patches/add-xbps-plugin.patch`. **Published** as
-`stores-r4`: the built artifacts are committed at this repository's root and
+`stores-r5`: the built artifacts are committed at this repository's root and
 served by GitHub Pages at
 `https://bluesloth.github.io/void-linux-gnome-software/`, the index is signed
 with the store's own key (DER sha256
@@ -37,8 +42,9 @@ authentication on the operator's box (install, cancel, uninstall, self-update,
 14-package full system update, flatpak regression, cold-start hygiene); item 10
 (OctoXBPS, not installed) is not run. **Item 13 (fresh-install story) is now
 PASS**: an operator GNOME desktop install of Void came up with GNOME Software
-from this store (version not captured on that box; `50.2_7` is the newest build
-this store serves). Resume at
+from this store running `50.2_7`; `50.2_8` is that build's plugin
+byte-for-byte with only the polkit annotations moved, so the proof carries
+over. Resume at
 `docs/HANDOFF-GNOME-SOFTWARE-XBPS-BACKEND.md` §13, after
 `docs/RESUME-20261027-GNOME-SOFTWARE-XBPS-APPSTREAM-FREE.md`.
 
@@ -82,7 +88,7 @@ XBPS_SIGNING_KEY=/path/to/key tools/publish.sh --from hostdir/binpkgs [--push]
 
 Repository release tags are `stores-rN` (per-repository counter — this repo's
 tags are independent of the discover repo's). **Status: published as
-`stores-r4`** — the served repository is live at
+`stores-r5`** — the served repository is live at
 `https://bluesloth.github.io/void-linux-gnome-software/` and the installer
 consumes it.
 
@@ -106,13 +112,24 @@ orphaned tags `stores-r1` → `a207b32` and `stores-r3` → `bff1185` were delet
 since neither is reachable from `main` and an unreachable tag keeps its
 commit's objects — including the cosmic blobs — alive in GitHub's storage.
 
-Served set (root of this repository, 2026-10-30):
+**History (2026-11-01):** `stores-r5` is the `[POLKIT-SNAP-PATH]` re-cut.
+Template `revision=7` → `8`, two lines of the policy changed, the package
+rebuilt (`50.2_8`), signed, indexed and published — a plain fast-forward
+(`4b26938..fcfcbeb`) with an annotated tag. The plugin is byte-identical to
+`_7`'s, so this release changes nothing but which polkit prompt wording the
+user sees.
+
+Served set (root of this repository, 2026-11-01):
 
 | file | sha256 |
 | --- | --- |
-| `x86_64-repodata` (2036 B, signed) | `c9f450cadf935de4f99a09cc02800c82e0c144b8bde899b42aea4526d25ea649` |
-| `gnome-software-50.2_7.x86_64.xbps` | `ed078a16c2cc4bfa36d84c7e74b5bb5bcd29e02ca5d25427e3b03321dcca2220` |
-| `gnome-software-devel-50.2_7.x86_64.xbps` | `18e2bbc65b35a05b33d079cc9ba78dd3d2c5654f28f008df834710502a5132d7` |
+| `x86_64-repodata` (2042 B, signed) | `884137891c0659e7dd2721060c07a7edb99e2a58c4e4e61dfc15702e742abac7` |
+| `gnome-software-50.2_8.x86_64.xbps` | `379d14be16c0f3ca5691b12df363857ece5365ffabaa93570e7b0cc52dddaaf6` |
+| `gnome-software-devel-50.2_8.x86_64.xbps` | `f9f8d28f9f21bb7b171ae9c226c2735cab777054fd19e5862939bac026c1d932` |
+
+The `_7` pair (index `c9f450ca…a649`) stays at the root alongside these:
+build numbers are not pruned (the cosmic precedent), the index advertises
+`_8` only.
 
 Both `.xbps` carry a `.sig2` that verifies against the store's public key, and
 the signed index embeds that same key (`signature-by Void Linux Stores
