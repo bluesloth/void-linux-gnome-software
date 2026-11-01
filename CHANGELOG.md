@@ -32,6 +32,45 @@ no shared epoch to key a tag on, unlike the COSMIC repository's
 repodata MUST be signed with the repository signing key; an unsigned repack
 makes clients abort (the 2026-10-09 `void-cosmic-repo` incident).
 
+## stores-r5 (2026-11-01)
+
+### `[POLKIT-SNAP-PATH]` — annotate the wrapper the installer actually ships
+
+`revision=7 → 8`. The `install` and `update` actions move their
+`org.freedesktop.policykit.exec.path` annotation from `/usr/bin/xbps-install`
+to `/usr/local/sbin/void-xbps-snap`. **Nothing else changes** — the action ids,
+every `exec.argv1` (`--yes` / `--yes` / `--sync`), the `auth_admin` defaults,
+the 1595-line backend patch and the template's build recipe are byte-identical
+to revision 7. The `remove` action deliberately keeps `/usr/bin/xbps-remove`:
+the installer's snapshot shadow only covers `xbps-install`, so `remove` already
+matched.
+
+**Why.** On every installer-provisioned box, `/usr/bin/xbps-install` and
+`/usr/sbin/xbps-install` are symlinks to the installer-owned
+`/usr/local/sbin/void-xbps-snap` (the snapper pre/post wrapper). pkexec
+canonicalises the program path (`realpath()`) *before* it looks up an action,
+so the old annotation could never match there: lookup fell through to pkexec's
+generic fallback and the user saw raw-argv wording ("Authentication is required
+to execute /usr/local/sbin/void-xbps-snap --yes") instead of this store's own
+"Authentication is required to install software" message. Annotating the
+canonical path restores the store's own message.
+
+**Failure mode is graceful, by design.** On a stock Void box (no shadow) the
+canonicalised path is the real `/usr/bin/xbps-install`, never matches the
+wrapper annotation, and lookup falls back to the same generic prompt as before.
+A wrong-path annotation can only degrade the *wording*; it can never authorise
+anything different, because every action stays `auth_admin` and the wrapper
+passes its argv straight through.
+
+Artefacts: template `revision=8`; policy `gs-xbps.policy`, sha256
+`88b69fbb6d86a5149f8ef87c811cbb97504053e07f42d57a4d03a5b27581942e`; package
+`gnome-software-50.2_8.x86_64.xbps`, 2684132 B, sha256
+`379d14be16c0f3ca5691b12df363857ece5365ffabaa93570e7b0cc52dddaaf6`;
+`gnome-software-devel-50.2_8.x86_64.xbps`, 324473 B, sha256
+`f9f8d28f9f21bb7b171ae9c226c2735cab777054fd19e5862939bac026c1d932`.
+The backend plugin is behaviourally unchanged — this is policy data only. The
+signing key is unchanged (DER sha256 `9bdf4599…0d60`).
+
 ## stores-r4 (2026-10-30)
 
 ### `[GNOME-SOFTWARE-XBPS]` — rev7: unserviceable queries return an empty list, not an error
