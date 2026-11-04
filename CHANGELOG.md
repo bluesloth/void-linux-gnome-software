@@ -32,6 +32,99 @@ no shared epoch to key a tag on, unlike the COSMIC repository's
 repodata MUST be signed with the repository signing key; an unsigned repack
 makes clients abort (the 2026-10-09 `void-cosmic-repo` incident).
 
+## stores-r6 (2026-11-03)
+
+### `[XBPS-REFRESH]` — sync the repodata before an update check
+
+`revision=8 → 9`. Software's update list comes from `xbps-install -nSu`,
+which is a **dry run**: it answers from the cached repodata and never syncs
+it. Nothing else on a stock Void box syncs either (there is no xbps cron
+job), so the backend reported "up to date" indefinitely while the mirrors
+moved on — the defect the COSMIC store carried until `epoch-1.11.0-r7`, fixed
+here in the same shape.
+
+**What is new.** The plugin now implements the plugin vfunc pair Software
+calls when it checks for updates:
+
+* `gs_plugin_xbps_refresh_metadata_async()` (`guint64 cache_age_secs`,
+  `GsPluginRefreshMetadataFlags`, `GsPluginEventCallback`, `GCancellable` —
+  the 50.2 `lib/gs-plugin.h` signature) spawns
+  `pkexec /usr/libexec/gnome-software-xbps-refresh`, `g_timeout_add_seconds
+  (120)` guards the result, and `gs_plugin_xbps_refresh_metadata_finish()`
+  consumes the child's output.
+* The child's stdout/stderr are **collected, never forwarded** — Software
+  raises its passive-message sheet on any plugin message, the same trap the
+  KDE backend hit. Nothing here becomes a user-visible message.
+* It **always** returns `TRUE`. The refresh is best effort: a refused
+  authorisation, a missing helper or an unreachable mirror leaves the cached
+  index in place, and the update list still populates from it. Failing the
+  vfunc would have replaced a stale list with no list.
+* The helper is given `/dev/null` on fd 0 through
+  `g_subprocess_launcher_take_fd()`, so a repository key-import question
+  reads EOF and declines exactly as it does when the helper is run alone.
+  This is why the refresh path builds its own `GSubprocessLauncher` instead of
+  reusing `gs_xbps_run_async()`, whose child inherits stdin.
+* Exit codes are named in the plugin log rather than collapsed by
+  `gs_xbps_run_finish()` (which maps anything non-zero to
+  `G_IO_ERROR_FAILED`): **126** authentication cancelled, **127** pkexec
+  could not run the helper, **75** the helper's `EX_TEMPFAIL` throttle
+  ("index synced recently"), signal death, and the 120 s timeout.
+
+**The helper** is `/usr/libexec/gnome-software-xbps-refresh`, package-owned,
+mode 755, `#!/bin/sh`, `set -u`: no arguments, root-only (it refuses
+otherwise, because `xbps-install` as a normal user fails every reposync with
+EPERM *and still exits 0*), one hardcoded `xbps-install -S`, a `/run` stamp
+throttle returning 75, and a preference for `/usr/bin/xbps-install.real` over
+the `void-xbps-snap` symlink so an update check does not take a snapper
+snapshot pair.
+
+**The privilege model.** A fourth action, `org.gnome.Software.xbps.refresh`,
+is `allow_active=yes` / `allow_any=no` / `allow_inactive=no`, annotated on
+`org.freedesktop.policykit.exec.path=/usr/libexec/gnome-software-xbps-refresh`.
+The three transaction actions are **unchanged from revision 8**:
+`auth_admin` on all three defaults, `exec.argv1` `--yes` / `--yes` /
+`--sync`, annotated on `/usr/local/sbin/void-xbps-snap` (install, update) and
+`/usr/bin/xbps-remove` (remove). Annotating `argv1=-S` on `xbps-install`
+itself was rejected for the same reason as in the other two stores: pkexec
+matches only the first argument, so that grant would have allowed a
+passwordless full transaction from any active session. A prompt on every
+update check would have made the feature unusable, and a refused refresh is
+harmless by construction.
+
+**A build-time catch worth remembering.** `g_subprocess_launcher_spawnv()`
+returns a `GSubprocess *`, not a `gboolean` — it takes `(launcher, argv,
+&error)` and yields the child. The first revision-9 build died on
+`error: too many arguments to function` and
+`passing argument 3 … from incompatible pointer type`; the patch now reads
+`subprocess = g_subprocess_launcher_spawnv (launcher, argv, &local_error); if
+(subprocess == NULL) { … }`. The new-file hunk header had to be recomputed
+(`@@ -0,0 +1,1201 @@`) and `git apply --check` re-run against a pristine 50.2
+tree.
+
+**Verified at build time** (this box runs COSMIC, so Software does not exist
+here — the packaged bytes are what could be checked):
+
+* `gnome-software-50.2_9.x86_64.xbps`, 2686628 B,
+  `sha256 adf2c10a…96ed`; `gnome-software-devel-50.2_9.x86_64.xbps`,
+  324467 B, `sha256 35d1f484…e954`. `./xbps-src pkg` `EXIT=0`.
+* inside the main package: `usr/libexec/gnome-software-xbps-refresh`
+  (4642 B), `usr/share/polkit-1/actions/org.gnome.Software.xbps.policy`
+  (3936 B, **exactly 4 actions**), and
+  `usr/lib/gnome-software/plugins-23/libgs_plugin_xbps.so` (md5
+  `d6da8c7b…6ed0`, was `22268a79…` at revision 7 — the difference is the
+  refresh vfunc pair and its message strings).
+* `strings` on the shipped plugin (plain C literals, unlike Qt's UTF-16
+  `QStringLiteral`s) shows `/usr/libexec/gnome-software-xbps-refresh` and all
+  thirteen `xbps: repodata …` messages.
+* `sh -n` clean on the helper; the policy parses as XML, and no comment
+  contains `--` (which would silently break policy loading).
+
+**Not verified here** (needs a GNOME box, owed): the click-driven matrix in
+`docs/HANDOFF-GNOME-SOFTWARE-XBPS-BACKEND.md` §15.4, including the refresh
+path at runtime.
+
+---
+
 ## stores-r5 (2026-11-01)
 
 ### `[POLKIT-SNAP-PATH]` — annotate the wrapper the installer actually ships

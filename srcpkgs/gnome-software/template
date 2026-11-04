@@ -1,7 +1,7 @@
 # Template file for 'gnome-software'
 pkgname=gnome-software
 version=50.2
-revision=8
+revision=9
 build_style=meson
 configure_args="-Dpackagekit=false -Dfwupd=false
  -Dmalcontent=false -Dwebapps=false $(vopt_bool gtk_doc)
@@ -32,9 +32,17 @@ fi
 # The xbps backend is carried as a patch against the 50.2 tree; the patch adds
 # plugins/xbps/ and the -Dxbps meson option (default OFF upstream of this
 # package, enabled here).  The polkit actions are installed below.
+#
+# gnome-software-xbps-refresh is the root helper behind the fourth
+# (allow_active) action: the plugin runs it through pkexec in
+# refresh_metadata_async, because `xbps-install -nSu` reads the cached
+# repodata and never syncs it.  It takes no arguments and can only run a bare
+# `xbps-install -S`; see the policy file header for why that grant is narrow.
 post_install() {
 	install -Dm644 ${FILESDIR}/gs-xbps.policy \
 		${DESTDIR}/usr/share/polkit-1/actions/org.gnome.Software.xbps.policy
+	install -Dm755 ${FILESDIR}/gnome-software-xbps-refresh \
+		${DESTDIR}/usr/libexec/gnome-software-xbps-refresh
 }
 
 do_check() {

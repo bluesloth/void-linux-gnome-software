@@ -23,7 +23,7 @@ new file mode 100644
 index 0000000..b57ef13
 --- /dev/null
 +++ b/plugins/xbps/gs-plugin-xbps.c
-@@ -0,0 +1,1023 @@
+@@ -0,0 +1,1201 @@
 +/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
 + * vi:set noexpandtab tabstop=8 shiftwidth=8:
 + *
@@ -56,8 +56,10 @@ index 0000000..b57ef13
 +
 +#include <config.h>
 +
++#include <fcntl.h>
 +#include <gio/gio.h>
 +#include <glib.h>
++#include <unistd.h>
 +
 +#include <gnome-software.h>
 +
@@ -68,6 +70,10 @@ index 0000000..b57ef13
 +#define XBPS_INSTALL	"/usr/bin/xbps-install"
 +#define XBPS_REMOVE	"/usr/bin/xbps-remove"
 +#define PKEXEC		"/usr/bin/pkexec"
++
++/* Package-owned root helper behind the fourth polkit action: it takes no
++ * arguments and can only run a bare `xbps-install -S`. */
++#define XBPS_REFRESH_HELPER "/usr/libexec/gnome-software-xbps-refresh"
 +
 +/* "void" is the stable data-id origin; the UI label stays human-readable. */
 +#define XBPS_ORIGIN	"void"
@@ -1016,6 +1022,176 @@ index 0000000..b57ef13
 +}
 +
 +/* ------------------------------------------------------------------------
++ * metadata refresh
++ *
++ * The updates query is `xbps-install -nSu`, a DRY RUN: it answers from the
++ * repodata that is already on disk and never syncs it. Nothing else on a
++ * stock Void box syncs it either (there is no xbps cron job), so without this
++ * hook the update list would be built from whatever index happened to be
++ * cached, and Software would report "up to date" indefinitely while the
++ * mirrors moved on. The same defect hid three real updates from the COSMIC
++ * store until revision 11 of that backend.
++ *
++ * The sync runs as a narrow, package-owned root helper through pkexec. Its
++ * polkit action is the fourth of this store and the only one which is not
++ * auth_admin: a password prompt on every check would make the feature
++ * unusable. That grant is safe because the action is annotated on the helper
++ * path, and the helper takes no arguments and can only ever run a bare
++ * `xbps-install -S`; annotating argv1="-S" on xbps-install itself would have
++ * let any active session run a full transaction unauthenticated. See the
++ * .policy header and the helper itself.
++ *
++ * Best effort by design: a refused authorisation (a locked session), a
++ * missing helper or an unreachable mirror all leave the cached index in
++ * place. Failing the whole refresh instead would leave Software with no
++ * update list at all, which is a far worse outcome than a stale one.
++ */
++
++typedef struct {
++	GSubprocess	*subprocess;	/* (owned) */
++	guint		 timeout_id;
++} RefreshData;
++
++static void
++refresh_data_free (RefreshData *data)
++{
++	if (data->timeout_id != 0)
++		g_source_remove (data->timeout_id);
++	g_clear_object (&data->subprocess);
++	g_free (data);
++}
++
++/* A polkit request that never resolves must not park the whole metadata
++ * refresh: kill the helper and let the cached index stand. */
++static gboolean
++refresh_timeout_cb (gpointer user_data)
++{
++	RefreshData *data = user_data;
++
++	data->timeout_id = 0;
++	g_debug ("xbps: repodata refresh timed out");
++	if (data->subprocess != NULL)
++		g_subprocess_force_exit (data->subprocess);
++	return G_SOURCE_REMOVE;
++}
++
++static void
++refresh_process_cb (GObject *source_object,
++		    GAsyncResult *result,
++		    gpointer user_data)
++{
++	g_autoptr(GTask) task = G_TASK (user_data);
++	GSubprocess *subprocess = G_SUBPROCESS (source_object);
++	g_autofree gchar *stdout_buf = NULL;
++	g_autofree gchar *stderr_buf = NULL;
++	g_autoptr(GError) local_error = NULL;
++
++	if (!g_subprocess_communicate_utf8_finish (subprocess, result,
++						   &stdout_buf, &stderr_buf,
++						   &local_error)) {
++		if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++			g_debug ("xbps: repodata refresh cancelled");
++		else
++			g_warning ("xbps: repodata refresh failed: %s",
++				   local_error->message);
++		g_task_return_boolean (task, TRUE);
++		return;
++	}
++
++	if (!g_subprocess_get_if_exited (subprocess)) {
++		g_warning ("xbps: repodata not refreshed, the helper was terminated by signal %d",
++			   g_subprocess_get_term_sig (subprocess));
++	} else {
++		gint exit_status = g_subprocess_get_exit_status (subprocess);
++
++		switch (exit_status) {
++		case 0:
++			g_debug ("xbps: repodata refreshed");
++			break;
++		case 75:
++			/* The helper's throttle (EX_TEMPFAIL): the index was
++			 * synced recently, so there was nothing to do. */
++			g_debug ("xbps: repodata refresh skipped, the index was synced recently");
++			break;
++		case 126:
++			g_debug ("xbps: repodata not refreshed, authentication was cancelled");
++			break;
++		case 127:
++			g_warning ("xbps: repodata not refreshed, pkexec could not run %s",
++				   XBPS_REFRESH_HELPER);
++			break;
++		default:
++			if (stderr_buf != NULL && *stderr_buf != '\0')
++				g_warning ("xbps: repodata not refreshed (helper exit status %d): %s",
++					   exit_status, g_strstrip (stderr_buf));
++			else
++				g_warning ("xbps: repodata not refreshed (helper exit status %d)",
++					   exit_status);
++			break;
++		}
++	}
++
++	g_task_return_boolean (task, TRUE);
++}
++
++static void
++gs_plugin_xbps_refresh_metadata_async (GsPlugin *plugin,
++				       guint64 cache_age_secs,
++				       GsPluginRefreshMetadataFlags flags,
++				       GsPluginEventCallback event_callback,
++				       gpointer event_user_data,
++				       GCancellable *cancellable,
++				       GAsyncReadyCallback callback,
++				       gpointer user_data)
++{
++	g_autoptr(GTask) task = NULL;
++	g_autoptr(GSubprocessLauncher) launcher = NULL;
++	g_autoptr(GSubprocess) subprocess = NULL;
++	g_autoptr(GError) local_error = NULL;
++	RefreshData *data;
++	const gchar *argv[] = { PKEXEC, XBPS_REFRESH_HELPER, NULL };
++	gint devnull_fd;
++
++	task = g_task_new (plugin, cancellable, callback, user_data);
++	g_task_set_source_tag (task, gs_plugin_xbps_refresh_metadata_async);
++
++	data = g_new0 (RefreshData, 1);
++	g_task_set_task_data (task, data, (GDestroyNotify) refresh_data_free);
++
++	launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
++					      G_SUBPROCESS_FLAGS_STDERR_PIPE);
++
++	/* The helper must never be handed an answer: a repository key import
++	 * question has to read EOF and decline, exactly as it does when the
++	 * helper is run on its own. */
++	devnull_fd = open ("/dev/null", O_RDONLY);
++	if (devnull_fd >= 0)
++		g_subprocess_launcher_take_fd (launcher, devnull_fd, STDIN_FILENO);
++
++	subprocess = g_subprocess_launcher_spawnv (launcher, argv, &local_error);
++	if (subprocess == NULL) {
++		g_warning ("xbps: repodata not refreshed: %s", local_error->message);
++		g_task_return_boolean (task, TRUE);
++		return;
++	}
++
++	data->subprocess = g_object_ref (subprocess);
++	data->timeout_id = g_timeout_add_seconds (120, refresh_timeout_cb, data);
++
++	g_subprocess_communicate_utf8_async (subprocess, NULL, cancellable,
++					     refresh_process_cb,
++					     g_steal_pointer (&task));
++}
++
++static gboolean
++gs_plugin_xbps_refresh_metadata_finish (GsPlugin *plugin,
++					GAsyncResult *result,
++					GError **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++/* ------------------------------------------------------------------------
 + * type registration
 + */
 +
@@ -1040,6 +1216,8 @@ index 0000000..b57ef13
 +	plugin_class->uninstall_apps_finish = gs_plugin_xbps_uninstall_apps_finish;
 +	plugin_class->update_apps_async = gs_plugin_xbps_update_apps_async;
 +	plugin_class->update_apps_finish = gs_plugin_xbps_update_apps_finish;
++	plugin_class->refresh_metadata_async = gs_plugin_xbps_refresh_metadata_async;
++	plugin_class->refresh_metadata_finish = gs_plugin_xbps_refresh_metadata_finish;
 +}
 +
 +GType
