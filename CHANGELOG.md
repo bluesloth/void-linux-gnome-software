@@ -123,6 +123,29 @@ here — the packaged bytes are what could be checked):
 `docs/HANDOFF-GNOME-SOFTWARE-XBPS-BACKEND.md` §15.4, including the refresh
 path at runtime.
 
+### `[PUBLISH-INDEX-ORDER]` — the publish tooling fix that rode along
+
+Before this release was published, `tools/publish.sh` still built
+`xbps-rindex -f -a`'s argument list with `find … | sort`. That is
+lexicographic, and `xbps-rindex -a` is last-wins for a given pkgname with `-f`
+overwriting unconditionally — so the moment a revision reaches `_10` the index
+ends up naming the **older** build. It bit
+`void-linux-discover`'s `stores-r4` release exactly that way (served
+`discover-6.7.5_10`, index said `_9`); the corrected index there is
+`stores-r5`, and the full analysis is in that repository's `CHANGELOG.md`.
+
+The script now resolves the index list per pkgname with `xbps-uhelper cmpver`
+and adds only the newest build of each name, printing a note when that differs
+from the lexical pick. It is copied byte-for-byte from the COSMIC repository's
+`tools/publish.sh`, which has carried the fix since `cosmic-store` `_10`. The
+two store repositories' copies stay identical by design (edit both together).
+
+Here the trap would have fired too: `gnome-software-50.2_9` sorts **after**
+`_8`, so `stores-r6` was already correct, but the next revision would not have
+been. The stage's `find` order is
+`_7 _8 _9` for both `gnome-software` and `gnome-software-devel`, so the
+resolver adds `_9` for each name and prints no note.
+
 ---
 
 ## stores-r5 (2026-11-01)
