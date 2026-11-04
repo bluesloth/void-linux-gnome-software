@@ -99,11 +99,16 @@ precedent). The `50.2_2`–`_6` rollback builds are not in this repository.
   are unverified until a GNOME box runs them.
 - `usr/libexec/gnome-software-xbps-refresh` — the argless helper the fourth
   polkit action annotates (4642 B, md5
-  `428483f02cf2456b6c691d613796c7e8`, `sh -n` clean). It runs
-  `xbps-install -S` (never a bare `-Sy`, and never `--`) and exits with the
-  child's status. It is package-owned and carries no arguments by design:
-  pkexec only matches `exec.argv1`, so a helper path is the only way to
-  authorise a sync separately from an install.
+  `428483f02cf2456b6c691d613796c7e8`, `sh -n` clean). It takes no arguments
+  and can only ever run `xbps-install -S` (never `-Syu`, never `-y`, with
+  stdin on `/dev/null` so a repository-key import question declines instead of
+  silently trusting a new key), resolving `/usr/bin/xbps-install.real` first so
+  a sync does not take a snapper snapshot pair through the
+  `void-xbps-snap` shadow. It throttles itself to one sync per 600 s with a
+  `/run` stamp (so it resets on reboot), exiting **75** (`EX_TEMPFAIL`) when it
+  skips and the child's status otherwise. The caller treats any non-zero status
+  as non-fatal but distinguishes 75 from a real failure so the log never claims
+  a sync that did not happen.
 - `usr/share/polkit-1/actions/org.gnome.Software.xbps.policy` — four actions
   now (`install` / `remove` / `update` / `refresh`), md5
   `effe371649aaf2c4222def0251f62a58`, sha256
