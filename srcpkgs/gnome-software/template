@@ -1,7 +1,7 @@
 # Template file for 'gnome-software'
 pkgname=gnome-software
 version=50.2
-revision=10
+revision=11
 build_style=meson
 configure_args="-Dpackagekit=false -Dfwupd=false
  -Dmalcontent=false -Dwebapps=false $(vopt_bool gtk_doc)
@@ -62,8 +62,11 @@ post_install() {
 	# metadata refresh runs the org.gnome.Software.xbps.refresh action, which
 	# is allow_active=yes (see gs-xbps.policy) -- it only re-syncs the xbps
 	# repodata through /usr/libexec/gnome-software-xbps-refresh.  The
+	# monitor's other background call is update_apps with NO_APPLY; the xbps
+	# plugin treats that as "mark ready, do not apply" (xbps has no separate
+	# download stage), so it never starts a privileged transaction.  The
 	# install/remove/update actions stay auth_admin and are only ever reached
-	# from a user gesture.
+	# from an explicit user gesture.
 	install -Dm644 ${FILESDIR}/gnome-software-autostart.desktop \
 		${DESTDIR}/etc/xdg/autostart/org.gnome.Software.desktop
 }

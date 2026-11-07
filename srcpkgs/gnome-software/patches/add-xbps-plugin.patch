@@ -23,7 +23,7 @@ new file mode 100644
 index 0000000..b57ef13
 --- /dev/null
 +++ b/plugins/xbps/gs-plugin-xbps.c
-@@ -0,0 +1,1201 @@
+@@ -0,0 +1,1226 @@
 +/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
 + * vi:set noexpandtab tabstop=8 shiftwidth=8:
 + *
@@ -1001,6 +1001,31 @@ index 0000000..b57ef13
 +	gboolean system_update;
 +
 +	g_task_set_source_tag (task, gs_plugin_xbps_update_apps_async);
++
++	/* NO_APPLY means "download, do not apply".  xbps has no separate
++	 * download stage: a transaction fetches and installs in one go, so
++	 * the only way to honour NO_APPLY is to do neither and mark the
++	 * updates ready instead.  The update monitor makes this call by
++	 * itself at startup and after resume whenever install-timestamp is
++	 * more than 14 days old (0 is the shipped default), with no user
++	 * present; starting a privileged transaction there is exactly the
++	 * polkit prompt this backend must never raise.  The interactive
++	 * Download button also passes NO_APPLY, and "ready" is the closest
++	 * xbps equivalent.  A real transaction only happens for an explicit
++	 * update, which stays behind auth_admin. */
++	if ((flags & GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY) != 0) {
++		for (guint i = 0; i < gs_app_list_length (apps); i++) {
++			GsApp *app = gs_app_list_index (apps, i);
++
++			if (!gs_app_has_management_plugin (app, plugin))
++				continue;
++			gs_app_set_size_download (app, GS_SIZE_TYPE_VALID, 0);
++		}
++		g_debug ("xbps: updates marked ready; not applying them");
++		g_task_return_boolean (task, TRUE);
++		return;
++	}
++
 +	collect_operation_data (task, apps, GS_APP_STATE_INSTALLING,
 +				GS_APP_STATE_INSTALLED, TRUE);
 +	data = g_task_get_task_data (task);

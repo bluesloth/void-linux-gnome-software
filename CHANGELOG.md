@@ -32,6 +32,49 @@ no shared epoch to key a tag on, unlike the COSMIC repository's
 repodata MUST be signed with the repository signing key; an unsigned repack
 makes clients abort (the 2026-10-09 `void-cosmic-repo` incident).
 
+## stores-r8 (2026-11-06)
+
+### `[NO-AUTO-APPLY]` — never start a privileged transaction from the monitor
+
+`revision=10 → 11`. `stores-r7` fixed the missing notifier but left one path
+unexamined: with the upstream defaults (`download-updates=true`,
+`install-timestamp=0`) the update monitor does not stop at *checking*. After
+its first hourly check it sees `install-timestamp` as more than 14 days old,
+so it calls `update_apps` with `GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY`
+("download, do not apply") at startup and after resume, with no user present.
+The xbps plugin ignored the flag and ran the full transaction:
+
+    pkexec /usr/bin/xbps-install --sync --update --yes -- linux6.18 less
+
+That transaction is `org.gnome.Software.xbps.update`, which is `auth_admin`,
+so the login/resume path raised the very polkit prompt the notifier must never
+raise. It also explains why `stores-r7` looked clean under
+`download-updates=false`: that setting disables the auto-update branch (and,
+incidentally, the automatic repodata refresh).
+
+**What changed.** `gs_plugin_xbps_update_apps_async()` now honours
+`NO_APPLY`. xbps has no separate download stage — a transaction fetches and
+installs in one go — so the backend does neither: it marks the updates it
+manages as ready (`size-download = 0`) and returns success. The monitor then
+sees offline updates that are ready and emits *"Updates Ready to Install"*.
+The interactive Download button also passes `NO_APPLY`; "ready" is the closest
+xbps equivalent there too. An explicit Update from the UI does not pass
+`NO_APPLY` and still runs the transaction under `auth_admin`.
+
+This also repairs the notification itself under the default settings: the
+monitor only notifies when `download-updates=true` *and* `all_downloaded` is
+true. Since the xbps plugin can never pre-stage packages, reporting a download
+size made that condition permanently false, so `stores-r7` produced no notice
+at all with default settings. With the backend marking updates ready, the
+check is true and the notice appears without any prompt.
+
+**Verification.** See `xbps-work/opencode/2026-11-06-gnome-software-notifier/`
+for the live runs: `run-live2` (the `download-updates=false` notification,
+click-through and no-prompt proof), `run-live3` (the defect: the
+`auth_admin` `pkexec` line above at ~51 s), and the revision-11 run with
+default settings (notification present, no `pkexec`, no
+`AuthenticationAgent` call).
+
 ## stores-r7 (2026-11-06)
 
 ### `[UPDATE-NOTIFIER]` — start Software's update monitor on any desktop
