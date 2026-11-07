@@ -5,26 +5,38 @@ source **and** the served binary repository for this store.
 One repository per store: KDE Discover lives in `private/void-linux-discover/`,
 cosmic-store in `private/void-linux-cosmic/` (epoch-managed).
 
-## Status: rev10 PUBLISHED — `stores-r7` served from GitHub Pages (2026-11-06)
+## Status: rev11 PUBLISHED — `stores-r8` served from GitHub Pages (2026-11-06)
 
 The plugin is written, meson-wired, patch-extracted, compiled and **validated on
 a real Void GNOME DE + GDM box** (rev7/rev8 feature matrix, handoff §13.3).
-rev10 is `gnome-software-50.2_10.x86_64.xbps` (2686454 B, sha256
-`868a218f…26914`); the plugin md5 is `d6da8c7b…6ed0`, unchanged from rev9, and
-the patch is still the same 1595 lines, sha256 `b23e9995…c4bc`, as rev7/rev8.
-**rev10 is a packaging-only change** (`[UPDATE-NOTIFIER]`, template
-`revision=10`): `post_install()` installs one extra file,
+rev11 is `gnome-software-50.2_11.x86_64.xbps` (2686278 B, sha256
+`9be5391d…5e2ad`); the plugin md5 is `5b28ac23…8a60`, and the patch is 1798
+lines, sha256 `43a2b200…8b42`. **rev11 is the `[NO-AUTO-APPLY]` fix**
+(template `revision=11`): the xbps plugin now honours
+`GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY`. xbps has no separate download stage,
+so instead of spawning the monitor's `auth_admin` `pkexec` transaction at
+startup and after resume, the backend marks the updates ready
+(`size-download = 0`) and returns success. That removes the login/resume
+polkit prompt `stores-r7` still had under the shipped defaults
+(`download-updates=true`, `install-timestamp=0`), and it makes
+`all_downloaded` true so *"Updates Ready to Install"* actually appears. An
+explicit GUI **Update** does not pass `NO_APPLY` and still runs under
+`auth_admin`; the policy and refresh helper are byte-identical to `_10`'s,
+and the file list is unchanged at 540 paths. The no-prompt path is proven by
+`run-live5` in `xbps-work/opencode/2026-11-06-gnome-software-notifier/`.
+
+rev10 added the **`[UPDATE-NOTIFIER]`** packaging change (template
+`revision=10`): `post_install()` installs
 `/etc/xdg/autostart/org.gnome.Software.desktop`, so Software's own update
 monitor runs on desktops that never keep the `org.gnome.Software` D-Bus name
 alive. It is the smallest descriptor that does the job —
 `Exec=gnome-software --gapplication-service`, `NoDisplay=true`,
 `X-GNOME-UsesNotifications=true` and **no `OnlyShowIn`**, so it applies to KDE
-Plasma and XFCE as much as to GNOME. No monitor code is patched: upstream
-already polls, throttles to one notice a day and raises a `GNotification`
-titled *"Software Update Available"* whose default action opens the app on its
-**Updates** page. The package's file list grows by exactly that one path
-(539 → 540), and the plugin, policy and refresh helper are byte-identical to
-`_9`'s. The update check stays unprivileged; nothing here prompts at login.
+Plasma and XFCE as much as to GNOME. Upstream already polls, throttles to one
+notice a day and raises a `GNotification` titled *"Software Update
+Available"* whose default action opens the app on its **Updates** page.
+`_10`'s file list grows by exactly that one path (539 → 540), and its plugin,
+policy and refresh helper are byte-identical to `_9`'s.
 
 rev7's only source change was that a query the backend cannot serve returns an
 empty `GsAppList` instead of `G_IO_ERROR_NOT_SUPPORTED`. rev8's only change was
@@ -55,9 +67,9 @@ categories stay empty without catalogs — accepted; search, installed, updates
 and details are the xbps surface. The `gs_xbps_run_finish()` exit-status fix
 from the first build is retained (126/127 → `G_IO_ERROR_PERMISSION_DENIED`).
 
-`srcpkgs/gnome-software/` carries the template (`revision=10`, `-Dxbps=true`),
+`srcpkgs/gnome-software/` carries the template (`revision=11`, `-Dxbps=true`),
 the four-action policy, the refresh helper, the update-notifier autostart
-descriptor and `patches/add-xbps-plugin.patch`. **Published** as `stores-r7`: the built
+descriptor and `patches/add-xbps-plugin.patch`. **Published** as `stores-r8`: the built
 artifacts are committed at this repository's root and served by GitHub Pages
 at `https://bluesloth.github.io/void-linux-gnome-software/`, the index is
 signed with the store's own key (DER sha256
@@ -73,11 +85,15 @@ PASS**: an operator GNOME desktop install of Void came up with GNOME Software
 from this store running `50.2_7`; `50.2_8` is that build's plugin
 byte-for-byte with only the polkit annotations moved, so the proof carries
 over. rev10 does not touch the plugin at all (md5 `d6da8c7b…6ed0` is `_9`'s),
-so every verdict above stands unchanged for it. **Not carried over:** the rev9
-refresh path and the cold-start prompt behaviour (`refresh_metadata_async` runs
-one `pkexec` per refresh by design) — those are the first things to verify on a
-fresh GNOME install, together with the rev10 notification (the entry is
-installed, but only a login on a non-GNOME desktop exercises it). Resume at
+so every verdict above stands unchanged for it. rev11 changes only the
+`NO_APPLY` branch of `gs_plugin_xbps_update_apps_async()` (md5
+`5b28ac23…8a60`), so install/remove/update still reach the same `auth_admin`
+actions; what changes is that the monitor's background auto-update no longer
+starts a privileged transaction. **Not carried over:** the rev9 refresh path
+and the cold-start prompt behaviour (`refresh_metadata_async` runs one `pkexec`
+per refresh by design) — those are the first things to verify on a fresh GNOME
+install, together with the rev10/rev11 notification (the entry is installed,
+but only a login on a non-GNOME desktop exercises it). Resume at
 `docs/HANDOFF-GNOME-SOFTWARE-XBPS-BACKEND.md` §13 and §15, after
 `docs/RESUME-20261027-GNOME-SOFTWARE-XBPS-APPSTREAM-FREE.md`.
 
@@ -129,7 +145,7 @@ XBPS_SIGNING_KEY=/path/to/key tools/publish.sh --from hostdir/binpkgs [--push]
 
 Repository release tags are `stores-rN` (per-repository counter — this repo's
 tags are independent of the discover repo's). **Status: published as
-`stores-r7`** — the served repository is live at
+`stores-r8`** — the served repository is live at
 `https://bluesloth.github.io/void-linux-gnome-software/` and the installer
 consumes it.
 
@@ -187,16 +203,32 @@ monitor. The package's file list grows by exactly that one path (539 → 540) an
 the plugin md5 stays `d6da8c7b…6ed0`, so the served binaries differ only in the
 added descriptor. Not carried over to cosmic-store yet (`docs/TODO.md`).
 
+**History (2026-11-06):** `stores-r8` is the `[NO-AUTO-APPLY]` release.
+Template `revision=10` → `11`. With the shipped defaults (`download-updates=true`,
+`install-timestamp=0`) the monitor calls `update_apps` with
+`GS_PLUGIN_UPDATE_APPS_FLAGS_NO_APPLY` at startup and after resume; the xbps
+plugin ignored that flag and ran the full `auth_admin` `pkexec` transaction,
+raising the login/resume prompt the notifier must never raise (and, under those
+defaults, preventing the notice because `all_downloaded` stayed false).
+`gs_plugin_xbps_update_apps_async()` now marks the updates ready
+(`size-download = 0`) and returns success without spawning a transaction; an
+explicit GUI **Update** still runs under `auth_admin`. Plugin md5
+`d6da8c7b…6ed0` → `5b28ac23…8a60`; policy, refresh helper, autostart entry and
+the 540-path file list are unchanged. The no-prompt proof is `run-live5` in
+`xbps-work/opencode/2026-11-06-gnome-software-notifier/` (synthetic pending
+update, *"Updates Ready to Install"* notification, click-through rc=0, no
+`AuthenticationAgent`).
+
 Served set (root of this repository, 2026-11-06):
 
 | file | sha256 |
 | --- | --- |
-| `x86_64-repodata` (2039 B, signed) | `87467bc542ff7135e1c735f113a9d1ac0655ac3fd59071d018f4baf2382eff98` |
-| `gnome-software-50.2_10.x86_64.xbps` | `868a218f0c904d1369b19bdadabb1a075b8d8bf65bed74264171e9eb1bc26914` |
-| `gnome-software-devel-50.2_10.x86_64.xbps` | `6ceb2cc0a9caf1eb702af05aaaf81993d9dde543643a660ab027cd850bb37b88` |
+| `x86_64-repodata` (2039 B, signed) | `03384099777041bcf0cefaa12aa39ce4f8ad166cf1c7d51cfd81162129d2ea87` |
+| `gnome-software-50.2_11.x86_64.xbps` | `9be5391dac6277e47503404f2c895c90546ba6629aa29b3e8ba6a3a56055e2ad` |
+| `gnome-software-devel-50.2_11.x86_64.xbps` | `7ea676412a5ca10ed1a16f9e66e24d4adab1f9d83aefe41d5170a68fcbee4efb` |
 
-The `_7`, `_8` and `_9` pairs stay at the root alongside these: build numbers
-are not pruned (the cosmic precedent), the index advertises `_10` only.
+The `_7` through `_10` pairs stay at the root alongside these: build numbers
+are not pruned (the cosmic precedent), the index advertises `_11` only.
 
 Both `.xbps` carry a `.sig2` that verifies against the store's public key, and
 the signed index embeds that same key (`signature-by Void Linux Stores
