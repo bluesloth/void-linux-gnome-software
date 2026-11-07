@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Software Update Notifier
+Comment=Start the background service that checks for software updates
+Exec=gnome-software --gapplication-service
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-UsesNotifications=true

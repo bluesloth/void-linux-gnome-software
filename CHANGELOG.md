@@ -32,6 +32,51 @@ no shared epoch to key a tag on, unlike the COSMIC repository's
 repodata MUST be signed with the repository signing key; an unsigned repack
 makes clients abort (the 2026-10-09 `void-cosmic-repo` incident).
 
+## stores-r7 (2026-11-06)
+
+### `[UPDATE-NOTIFIER]` — start Software's update monitor on any desktop
+
+`revision=9 → 10`. Software has shipped `gs-update-monitor` for years: it
+polls for updates on a timer, throttles the notice to once a day, and raises a
+`GNotification` titled *"Software Update Available"* whose default action
+opens the app on its **Updates** page (`app.set-mode` → `"updates"`). On a
+GNOME session that monitor always runs — the shell keeps the
+`org.gnome.Software` D-Bus name alive for search providers and the
+`DBusActivatable` desktop entry, and `GsApplication` creates the monitor
+unconditionally in `startup`. On every other desktop nothing ever starts the
+service, so the monitor never exists and no notification can ever appear —
+which is exactly the case on this project's other targets (KDE Plasma, XFCE,
+and any session without a GNOME shell).
+
+**What is new.** `post_install()` now installs
+`/etc/xdg/autostart/org.gnome.Software.desktop`. It is deliberately the
+smallest possible descriptor: `Exec=gnome-software --gapplication-service`,
+which is *verbatim* the `Exec=` of the D-Bus service file this package already
+ships (`src/org.gnome.Software.service.in`), so it starts the same process in
+the same mode — the desktop-independent activation path. `NoDisplay=true`
+(the user never sees it in a menu), `X-GNOME-Autostart-enabled=true`,
+`X-GNOME-UsesNotifications=true`, and **no `OnlyShowIn`**: working where D-Bus
+activation does not is the entire point.
+
+**No password prompt.** The monitor's metadata refresh goes through the plugin's
+`refresh_metadata_async`, which runs `pkexec
+/usr/libexec/gnome-software-xbps-refresh` under the
+`org.gnome.Software.xbps.refresh` action — `allow_active=yes` since
+`stores-r6`, and it can only run a bare `xbps-install -S`. The
+`install`/`remove`/`update` actions stay `auth_admin` and are only ever reached
+from a user gesture. A background start therefore produces no dialog at login
+or resume.
+
+**No patch.** `gs-update-monitor.c` is untouched. Every update query it makes
+goes through `gs_plugin_loader_job_process_async`, so the xbps plugin that
+`stores-r5`/`stores-r6` carried supplies the pending-update count as-is.
+
+**Known limits.** The notice needs a running `GsApplication`, so it appears
+only after the autostart entry has started one — i.e. after login, not from the
+greeter. Software's own preference is a 24-hour throttle keyed on the
+`update-notification-timestamp` setting, so a second login the same day is
+silent by design.
+
 ## stores-r6 (2026-11-03)
 
 ### `[XBPS-REFRESH]` — sync the repodata before an update check

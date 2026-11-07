@@ -1,7 +1,7 @@
 # Template file for 'gnome-software'
 pkgname=gnome-software
 version=50.2
-revision=9
+revision=10
 build_style=meson
 configure_args="-Dpackagekit=false -Dfwupd=false
  -Dmalcontent=false -Dwebapps=false $(vopt_bool gtk_doc)
@@ -43,6 +43,29 @@ post_install() {
 		${DESTDIR}/usr/share/polkit-1/actions/org.gnome.Software.xbps.policy
 	install -Dm755 ${FILESDIR}/gnome-software-xbps-refresh \
 		${DESTDIR}/usr/libexec/gnome-software-xbps-refresh
+
+	# [UPDATE-NOTIFIER] On a GNOME session the shell keeps the
+	# org.gnome.Software D-Bus name alive, so gs-update-monitor -- which is
+	# created unconditionally in GsApplication::startup -- is running and its
+	# periodic "updates available" GNotification appears.  Void's other
+	# desktops (KDE Plasma, XFCE, ...) have no such activator: nothing ever
+	# starts the service, the monitor never runs, and no notification can
+	# ever be emitted.  This XDG autostart entry is the descriptor-agnostic
+	# launcher -- it is exactly the invocation the shipped D-Bus .service
+	# file uses (Exec=@bindir@/gnome-software --gapplication-service).
+	#
+	# It deliberately carries no OnlyShowIn: the point is to work where the
+	# D-Bus activation does not.  X-GNOME-UsesNotifications is set so the
+	# desktop's session manager knows the process wants to notify.
+	#
+	# No password prompt results from the background start: the monitor's
+	# metadata refresh runs the org.gnome.Software.xbps.refresh action, which
+	# is allow_active=yes (see gs-xbps.policy) -- it only re-syncs the xbps
+	# repodata through /usr/libexec/gnome-software-xbps-refresh.  The
+	# install/remove/update actions stay auth_admin and are only ever reached
+	# from a user gesture.
+	install -Dm644 ${FILESDIR}/gnome-software-autostart.desktop \
+		${DESTDIR}/etc/xdg/autostart/org.gnome.Software.desktop
 }
 
 do_check() {
